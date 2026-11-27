@@ -12,14 +12,16 @@
  *
  * Reliability:
  * - **Retries on 5xx + 429 + network errors** — до `maxRetries` (дефолт 2)
- *   с экспоненциальным backoff (0.5s, 1s, 2s + jitter).
+ *   с экспоненциальным backoff (0.5s, 1s, 2s + jitter), Retry-After до 60 с.
  * - **Auto Idempotency-Key** — каждому POST автоматически проставляется UUID v4,
- *   если клиент не передал свой. Гарантирует что retry не создаст дубль.
+ *   если клиент не передал свой: повтор SDK не создаёт вторую задачу. Если
+ *   повтор получил 409 «первый запрос ещё выполняется», SDK ждёт его ответ.
  *   Исключение — стрим чата: ключ уходит только если передан явно, а повтор
  *   делается только когда запрос не дошёл до сервера.
  */
 
 import {
+  APIResponseValidationError,
   AuthenticationError,
   BillingError,
   ConflictError,
@@ -34,11 +36,17 @@ import {
 } from "./errors.js";
 import {
   backoffDelayMs,
+  CONFLICT_WAIT_BUDGET_MS,
+  DEFAULT_GENERATE_TIMEOUT_MS,
   DEFAULT_LONG_TIMEOUT_MS,
   generateIdempotencyKey,
   isNotSentError,
+  isTransientError,
+  MAX_TIMER_MS,
+  parseRetryAfterMs,
   RETRYABLE_STATUSES,
   sleep,
+  truncate,
 } from "./internal.js";
 import { Chat, V1 } from "./v1.js";
 
@@ -46,7 +54,7 @@ const DEFAULT_BASE_URL = "https://nexusapi.dev";
 const DEFAULT_TIMEOUT_MS = 60_000;
 const DEFAULT_MAX_RETRIES = 2;
 /** Версия SDK (уходит в User-Agent). Тест сверяет её с package.json. */
-export const VERSION = "0.3.0";
+export const VERSION = "0.3.1";
 
 // ============================================================
 // Типы
@@ -58,6 +66,8 @@ export interface TaskResult {
   video_url?: string;
   image_url?: string;
   image_urls?: string[];
+  audio_url?: string;
+  audio_urls?: string[];
   [k: string]: unknown;
 }
 
@@ -80,7 +90,7 @@ export interface ImageGenerateParams {
   aspect_ratio?: string;
   /** Если true (default) — SDK сам ждёт завершения; иначе возвращает pending Task */
   wait?: boolean;
-  /** Таймаут polling'а в мс (только если wait=true). Дефолт 180000. */
+  /** Таймаут polling'а в мс (только если wait=true). Дефолт 600000. */
   timeout?: number;
   /** Интервал polling'а в мс. Дефолт 1500. */
   pollInterval?: number;
@@ -88,6 +98,15 @@ export interface ImageGenerateParams {
   idempotencyKey?: string;
   /** Любые native-параметры (image_url для edit и т.д.) */
   [extra: string]: unknown;
+}
+
+export interface WaitOptions {
+  /** Сколько ждать, мс. По умолчанию 600000. */
+  timeoutMs?: number;
+  /** Интервал опроса, мс. По умолчанию 3000. */
+  pollIntervalMs?: number;
+  /** Отмена ожидания (задача на сервере продолжит идти). */
+  signal?: AbortSignal;
 }
 
 export type PriceUnit = "sec" | "shot" | "request" | "token";
@@ -126,8 +145,9 @@ export interface ClientOptions {
   apiKey: string;
   baseUrl?: string;
   /**
-   * Per-request HTTP timeout. Default 60000. Для чата и /v1/images/generations
-   * — не меньше 600000 (их можно переопределить параметром `timeoutMs` метода).
+   * Таймаут запроса, мс (вместе с чтением ответа). Default 60000. Для
+   * POST /generate — не меньше 120000, для чата и /v1/images/generations —
+   * не меньше 600000 (их можно переопределить параметром `timeoutMs` метода).
    */
   timeoutMs?: number;
   /** Max retry attempts on 5xx/429/network errors. Default 2. 0 to disable. */
@@ -140,54 +160,70 @@ export interface ClientOptions {
 // Helpers (shared)
 // ============================================================
 
-interface ParsedError {
-  message: string;
-  errorClass: new (message: string, status?: number, body?: unknown) => NexusError;
-  body: unknown;
+type ErrorClass = new (message: string, status?: number, body?: unknown) => NexusError;
+
+const STATUS_ERRORS: Record<number, ErrorClass> = {
+  400: ValidationError,
+  401: AuthenticationError,
+  402: BillingError,
+  403: PermissionError,
+  404: NotFoundError,
+  409: ConflictError,
+  422: ValidationError,
+  429: RateLimitError,
+};
+
+/** Сообщение об ошибке из тела ответа любой формы, не длиннее 500 символов. */
+function errorMessage(body: unknown, text: string, status: number): string {
+  let message: unknown;
+  if (body && typeof body === "object" && !Array.isArray(body)) {
+    const { error, detail } = body as { error?: unknown; detail?: unknown };
+    if (error && typeof error === "object") message = (error as { message?: unknown }).message;
+    else if (typeof error === "string") message = error;
+    if (!message) {
+      if (typeof detail === "string") {
+        message = detail;
+      } else if (Array.isArray(detail) && detail.length > 0) {
+        const first = detail[0] as unknown;
+        if (first && typeof first === "object") {
+          // Pydantic-валидация: [{ loc: [...], msg }]
+          const { loc, msg } = first as { loc?: unknown; msg?: unknown };
+          const path = Array.isArray(loc) ? loc.slice(1).join(".") : "";
+          message = `${path || "request"}: ${typeof msg === "string" ? msg : "invalid"}`;
+        } else {
+          message = String(first);
+        }
+      } else if (detail && typeof detail === "object") {
+        const d = detail as { message?: unknown; msg?: unknown };
+        message = d.message ?? d.msg ?? JSON.stringify(detail);
+      }
+    }
+  } else if (text) {
+    message = text;
+  }
+  return message ? truncate(String(message)) : `HTTP ${status}`;
 }
 
-async function parseErrorResponse(resp: Response): Promise<ParsedError> {
+function headersToObject(headers: Headers): Record<string, string> {
+  const out: Record<string, string> = {};
+  headers.forEach((value, key) => {
+    out[key] = value;
+  });
+  return out;
+}
+
+function statusError(resp: Response, text: string, idempotencyKey?: string): NexusError {
   let body: unknown;
-  let message = `HTTP ${resp.status}`;
-  let text = "";
   try {
-    text = await resp.text();
+    body = text ? JSON.parse(text) : undefined;
   } catch {
-    /* ignore */
+    body = text ? truncate(text, 2000) : undefined;
   }
-  try {
-    body = JSON.parse(text);
-    const b = body as {
-      error?: { message?: string };
-      detail?: string | Array<{ loc?: string[]; msg?: string }>;
-    };
-    if (b?.error?.message) {
-      // OpenAI-shape (/v1/*)
-      message = b.error.message;
-    } else if (typeof b?.detail === "string") {
-      message = b.detail;
-    } else if (Array.isArray(b?.detail) && b.detail.length > 0) {
-      const first = b.detail[0];
-      const loc = (first?.loc ?? []).slice(1).join(".") || "request";
-      const msg = first?.msg ?? "invalid";
-      message = `${loc}: ${msg}`;
-    }
-  } catch {
-    body = undefined;
-    if (text) message = text;
-  }
-  const code = resp.status;
-  const map: Record<number, ParsedError["errorClass"]> = {
-    400: ValidationError,
-    401: AuthenticationError,
-    402: BillingError,
-    403: PermissionError,
-    404: NotFoundError,
-    409: ConflictError,
-    422: ValidationError,
-    429: RateLimitError,
-  };
-  return { message, errorClass: map[code] ?? NexusError, body };
+  const ErrorCtor = STATUS_ERRORS[resp.status] ?? NexusError;
+  const err = new ErrorCtor(errorMessage(body, text, resp.status), resp.status, body);
+  err.headers = headersToObject(resp.headers);
+  err.idempotencyKey = idempotencyKey;
+  return err;
 }
 
 function buildGenerateParams(
@@ -204,6 +240,41 @@ function buildGenerateParams(
     if (v !== undefined && v !== null) params[k] = v;
   }
   return params;
+}
+
+function requireTaskId(data: unknown, idempotencyKey?: string): string {
+  const taskId = (data as { task_id?: unknown } | null | undefined)?.task_id;
+  if (typeof taskId !== "string" || !taskId) {
+    const err = new APIResponseValidationError("Server response has no task_id", undefined, data);
+    err.idempotencyKey = idempotencyKey;
+    throw err;
+  }
+  return taskId;
+}
+
+function normalizeBaseUrl(baseUrl: string): string {
+  let url = baseUrl.replace(/\/+$/, "");
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new TypeError(`baseUrl must be an http(s) URL, got "${baseUrl}"`);
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new TypeError(`baseUrl must be an http(s) URL, got "${baseUrl}"`);
+  }
+  if (url.endsWith("/v1")) {
+    url = url.slice(0, -"/v1".length);
+    const proc = (globalThis as { process?: { emitWarning?: (msg: string) => void } }).process;
+    proc?.emitWarning?.(`nexusapi-sdk: baseUrl should not end with /v1 (the SDK adds it where needed); using ${url}`);
+  }
+  return url;
+}
+
+function validateTimeout(name: string, value: number): void {
+  if (!Number.isFinite(value) || value <= 0 || value > MAX_TIMER_MS) {
+    throw new RangeError(`${name} must be a positive number of milliseconds up to ${MAX_TIMER_MS}`);
+  }
 }
 
 // ============================================================
@@ -227,10 +298,11 @@ export class Task {
   error?: string;
   createdAt?: string;
 
-  private readonly _client: NexusClient;
+  // #private: не попадает в console.log / JSON и не тянет за собой клиент с ключом.
+  readonly #client: NexusClient;
 
   constructor(client: NexusClient, init: TaskInit) {
-    this._client = client;
+    this.#client = client;
     this.id = init.id;
     this.status = init.status;
     this.model = init.model;
@@ -243,23 +315,55 @@ export class Task {
     return this.status === "completed" || this.status === "failed";
   }
 
+  #result(): TaskResult {
+    const r = this.result as unknown;
+    return r && typeof r === "object" && !Array.isArray(r) ? (r as TaskResult) : {};
+  }
+
   get videoUrl(): string | undefined {
-    return this.result?.video_url as string | undefined;
+    const url = this.#result().video_url;
+    return typeof url === "string" ? url : undefined;
   }
 
   get imageUrl(): string | undefined {
-    const urls = this.result?.image_urls;
-    if (Array.isArray(urls) && urls.length > 0) return urls[0];
-    return this.result?.image_url as string | undefined;
+    const urls = this.imageUrls;
+    if (urls.length > 0) return urls[0];
+    const url = this.#result().image_url;
+    return typeof url === "string" ? url : undefined;
   }
 
   get imageUrls(): string[] {
-    const urls = this.result?.image_urls;
+    const urls = this.#result().image_urls;
     return Array.isArray(urls) ? urls : [];
   }
 
-  async refresh(): Promise<this> {
-    const fresh = await this._client.tasks.get(this.id);
+  /** audio_urls[0] (Suno и др.) или audio_url. */
+  get audioUrl(): string | undefined {
+    const urls = this.audioUrls;
+    if (urls.length > 0) return urls[0];
+    const url = this.#result().audio_url;
+    return typeof url === "string" ? url : undefined;
+  }
+
+  get audioUrls(): string[] {
+    const urls = this.#result().audio_urls;
+    return Array.isArray(urls) ? urls : [];
+  }
+
+  /** Данные задачи без ссылки на клиент — для JSON.stringify и логов. */
+  toJSON(): TaskInit {
+    return {
+      id: this.id,
+      status: this.status,
+      model: this.model,
+      result: this.result,
+      error: this.error,
+      createdAt: this.createdAt,
+    };
+  }
+
+  async refresh(options: { signal?: AbortSignal } = {}): Promise<this> {
+    const fresh = await this.#client.tasks.get(this.id, options);
     this.status = fresh.status;
     this.result = fresh.result;
     this.error = fresh.error;
@@ -269,35 +373,58 @@ export class Task {
   }
 
   /**
-   * Ожидает завершения задачи через polling.
+   * Ожидает завершения задачи через polling. Временные ошибки опроса (сеть,
+   * 429, 5xx) пережидает до дедлайна.
    *
-   * @param timeoutMs default 600000 (10 минут) для долгих видео-моделей
-   * @param pollIntervalMs default 3000
-   * @throws TaskTimeoutError если не дождались
+   * `wait(timeoutMs?, pollIntervalMs?)` или `wait({ timeoutMs, pollIntervalMs, signal })`.
+   *
+   * @throws TaskTimeoutError если не дождались — задача продолжает идти, `.task`
+   *   можно дождаться ещё раз
    * @throws TaskFailedError если статус стал failed
    */
-  async wait(
-    timeoutMs: number = 600_000,
-    pollIntervalMs: number = 3_000,
-  ): Promise<this> {
+  async wait(timeoutOrOptions?: number | WaitOptions, pollIntervalMs?: number): Promise<this> {
+    const opts: WaitOptions =
+      typeof timeoutOrOptions === "object" ? timeoutOrOptions : { timeoutMs: timeoutOrOptions, pollIntervalMs };
+    const timeoutMs = opts.timeoutMs ?? 600_000;
+    const interval = opts.pollIntervalMs ?? 3_000;
+    const { signal } = opts;
     const deadline = Date.now() + timeoutMs;
     while (!this.isDone) {
-      if (Date.now() > deadline) {
-        throw new TaskTimeoutError(
-          `Task ${this.id} did not complete within ${timeoutMs}ms`,
-          { task_id: this.id, last_status: this.status },
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        throw this.#attach(
+          new TaskTimeoutError(
+            `Task ${this.id} did not complete within ${timeoutMs}ms (last status: ${this.status}); ` +
+              `it is still running — wait for it again, do not create a new one`,
+            { task_id: this.id, last_status: this.status },
+          ),
         );
       }
-      await sleep(pollIntervalMs);
-      await this.refresh();
+      await sleep(Math.min(interval, remaining), signal);
+      try {
+        await this.refresh({ signal });
+      } catch (e) {
+        if (signal?.aborted || !isTransientError(e) || Date.now() >= deadline) {
+          if (e instanceof NexusError) this.#attach(e);
+          throw e;
+        }
+      }
     }
     if (this.status === "failed") {
-      throw new TaskFailedError(
-        `Task ${this.id} failed: ${this.error ?? "unknown error"}`,
-        { task_id: this.id, error: this.error },
+      throw this.#attach(
+        new TaskFailedError(`Task ${this.id} failed: ${this.error ?? "unknown error"}`, {
+          task_id: this.id,
+          error: this.error,
+        }),
       );
     }
     return this;
+  }
+
+  #attach<E extends NexusError>(err: E): E {
+    err.taskId = this.id;
+    err.task = this;
+    return err;
   }
 }
 
@@ -311,15 +438,13 @@ class Videos {
   async create(params: VideoCreateParams): Promise<Task> {
     const { model, prompt, duration, aspect_ratio, idempotencyKey, ...extras } = params;
     const apiParams = buildGenerateParams(model, prompt, { duration, aspect_ratio }, extras);
-    const data = await this.client._request<{ task_id: string }>("POST", "/generate", {
+    const key = generateIdempotencyKey(idempotencyKey);
+    const data = await this.client._request<unknown>("POST", "/generate", {
       body: { params: apiParams },
-      extraHeaders: { "Idempotency-Key": generateIdempotencyKey(idempotencyKey) },
+      extraHeaders: { "Idempotency-Key": key },
+      timeoutMs: this.client._generateTimeoutMs(),
     });
-    return new Task(this.client, {
-      id: data.task_id,
-      status: "pending",
-      model,
-    });
+    return new Task(this.client, { id: requireTaskId(data, key), status: "pending", model });
   }
 }
 
@@ -332,17 +457,19 @@ class Images {
       prompt,
       aspect_ratio,
       wait = true,
-      timeout = 180_000,
+      timeout = 600_000,
       pollInterval = 1_500,
       idempotencyKey,
       ...extras
     } = params;
     const apiParams = buildGenerateParams(model, prompt, { aspect_ratio }, extras);
-    const data = await this.client._request<{ task_id: string }>("POST", "/generate", {
+    const key = generateIdempotencyKey(idempotencyKey);
+    const data = await this.client._request<unknown>("POST", "/generate", {
       body: { params: apiParams },
-      extraHeaders: { "Idempotency-Key": generateIdempotencyKey(idempotencyKey) },
+      extraHeaders: { "Idempotency-Key": key },
+      timeoutMs: this.client._generateTimeoutMs(),
     });
-    const task = new Task(this.client, { id: data.task_id, status: "pending", model });
+    const task = new Task(this.client, { id: requireTaskId(data, key), status: "pending", model });
     if (wait) {
       await task.wait(timeout, pollInterval);
     }
@@ -353,16 +480,21 @@ class Images {
 class Tasks {
   constructor(private readonly client: NexusClient) {}
 
-  async get(taskId: string): Promise<Task> {
+  async get(taskId: string, options: { signal?: AbortSignal } = {}): Promise<Task> {
+    if (!taskId) throw new TypeError("taskId is required");
     const data = await this.client._request<{
-      task_id: string;
-      status: TaskStatus;
+      task_id?: string;
+      status?: TaskStatus;
       result?: TaskResult;
       error?: string;
       created_at?: string;
-    }>("GET", `/tasks/${taskId}`);
+    }>("GET", `/tasks/${encodeURIComponent(taskId)}`, { signal: options.signal });
+    const id = requireTaskId(data);
+    if (typeof data.status !== "string") {
+      throw new APIResponseValidationError("Server response has no task status", undefined, data);
+    }
     return new Task(this.client, {
-      id: data.task_id,
+      id,
       status: data.status,
       result: data.result,
       error: data.error,
@@ -388,7 +520,7 @@ export interface RequestOptions {
   body?: unknown;
   auth?: boolean;
   extraHeaders?: Record<string, string>;
-  /** Таймаут до получения заголовков ответа (для обычных запросов — и тела). */
+  /** Таймаут запроса, мс: для обычных запросов — вместе с чтением тела, для стрима — до заголовков. */
   timeoutMs?: number;
   retryStatuses?: ReadonlySet<number>;
   /**
@@ -399,8 +531,18 @@ export interface RequestOptions {
   signal?: AbortSignal;
 }
 
+/** @internal */
+export interface SendResult {
+  response: Response;
+  /** Тело ответа (для stream=false). */
+  text: string;
+  controller: AbortController;
+  cleanup: () => void;
+}
+
 export class NexusClient {
-  private readonly apiKey: string;
+  // #private: ключ не виден в console.log / util.inspect / JSON.
+  readonly #apiKey: string;
   private readonly baseUrl: string;
   private readonly timeoutMs: number;
   private readonly maxRetries: number;
@@ -419,13 +561,16 @@ export class NexusClient {
     if (!opts.apiKey) {
       throw new AuthenticationError("apiKey is required");
     }
-    if (opts.maxRetries !== undefined && opts.maxRetries < 0) {
-      throw new Error("maxRetries must be >= 0");
+    const maxRetries = opts.maxRetries ?? DEFAULT_MAX_RETRIES;
+    if (!Number.isInteger(maxRetries) || maxRetries < 0) {
+      throw new Error("maxRetries must be >= 0 (an integer)");
     }
-    this.apiKey = opts.apiKey;
-    this.baseUrl = (opts.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, "");
-    this.timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    this.maxRetries = opts.maxRetries ?? DEFAULT_MAX_RETRIES;
+    const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    validateTimeout("timeoutMs", timeoutMs);
+    this.#apiKey = opts.apiKey;
+    this.baseUrl = normalizeBaseUrl(opts.baseUrl ?? DEFAULT_BASE_URL);
+    this.timeoutMs = timeoutMs;
+    this.maxRetries = maxRetries;
     this.fetchImpl = opts.fetch ?? globalThis.fetch.bind(globalThis);
 
     this.videos = new Videos(this);
@@ -438,20 +583,24 @@ export class NexusClient {
 
   /** @internal Таймаут долгого /v1-запроса: явный или не меньше 600000 мс. */
   _longTimeoutMs(override?: number): number {
-    return override ?? Math.max(this.timeoutMs, DEFAULT_LONG_TIMEOUT_MS);
+    const value = override ?? Math.max(this.timeoutMs, DEFAULT_LONG_TIMEOUT_MS);
+    validateTimeout("timeoutMs", value);
+    return value;
+  }
+
+  /** @internal Таймаут создания задачи (POST /generate, /v1/videos): не меньше 120000 мс. */
+  _generateTimeoutMs(): number {
+    return Math.max(this.timeoutMs, DEFAULT_GENERATE_TIMEOUT_MS);
   }
 
   /**
    * @internal
-   * Отправляет запрос с повторами и возвращает успешный Response.
-   * stream=true: таймаут действует только до заголовков ответа, тело читает
-   * Stream; повтор при сетевой ошибке — только если запрос точно не ушёл.
+   * Отправляет запрос с повторами и возвращает успешный ответ.
+   * stream=false: таймаут и signal покрывают и чтение тела (оно в `text`).
+   * stream=true: таймаут действует только до заголовков, тело читает Stream;
+   * повтор при сетевой ошибке — только если запрос точно не ушёл.
    */
-  async _send(
-    method: string,
-    path: string,
-    opts: RequestOptions & { stream?: boolean } = {},
-  ): Promise<{ response: Response; controller: AbortController; cleanup: () => void }> {
+  async _send(method: string, path: string, opts: RequestOptions & { stream?: boolean } = {}): Promise<SendResult> {
     const {
       body,
       auth = true,
@@ -467,11 +616,15 @@ export class NexusClient {
       "User-Agent": `nexusapi-node/${VERSION}`,
     };
     if (body !== undefined) headers["Content-Type"] = "application/json";
-    if (auth) headers.Authorization = `Bearer ${this.apiKey}`;
+    if (auth) headers.Authorization = `Bearer ${this.#apiKey}`;
     if (extraHeaders) Object.assign(headers, extraHeaders);
     const idempotencyKey = headers["Idempotency-Key"];
+    // Сериализуем один раз и до цикла: ошибка в данных — не повод для повторов.
+    const payload = body !== undefined ? JSON.stringify(body) : undefined;
 
     let attempt = 0;
+    let conflictAttempt = 0;
+    let conflictDeadline: number | undefined;
     // Цикл retries — выходим либо через return (success), либо через throw.
     // eslint-disable-next-line no-constant-condition
     while (true) {
@@ -480,67 +633,59 @@ export class NexusClient {
       const cleanup = () => signal?.removeEventListener("abort", onUserAbort);
       if (signal?.aborted) controller.abort(signal.reason);
       else signal?.addEventListener("abort", onUserAbort, { once: true });
-      const timeoutHandle = setTimeout(() => controller.abort(), timeoutMs);
+      let timedOut = false;
+      const timeoutHandle = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, timeoutMs);
 
       let resp: Response;
+      let text = "";
       try {
         resp = await this.fetchImpl(url, {
           method,
           headers,
-          body: body !== undefined ? JSON.stringify(body) : undefined,
+          body: payload,
           signal: controller.signal,
         });
+        // Тело читаем под тем же таймаутом и signal (кроме удачного стрима).
+        if (!stream || !resp.ok) text = await resp.text();
       } catch (e) {
         clearTimeout(timeoutHandle);
         cleanup();
         // Отмена пользователем — не повторяем, пробрасываем как есть (AbortError).
         if (signal?.aborted) throw e;
-        // fetch throws TypeError for network errors, AbortError for timeout.
         const notSent = isNotSentError(e);
         if ((retrySentErrors || notSent) && attempt < this.maxRetries) {
-          await sleep(backoffDelayMs(attempt));
+          await sleep(backoffDelayMs(attempt), signal);
           attempt += 1;
           continue;
         }
-        const reason = e instanceof Error ? e.message : String(e);
-        let message = `Network error after ${attempt + 1} attempts: ${reason}`;
-        if (idempotencyKey && !notSent) {
-          message +=
-            `. The request may still be running on the server: repeat the call with ` +
-            `idempotencyKey "${idempotencyKey}" to get its result without a second charge`;
-        }
-        const err = new NetworkError(message);
-        err.idempotencyKey = idempotencyKey;
-        throw err;
+        throw networkError(e, { attempt, notSent, stream, timedOut, timeoutMs, idempotencyKey });
       }
       clearTimeout(timeoutHandle);
-      if (!stream) cleanup();
+      if (!stream || !resp.ok) cleanup();
 
       if (retryStatuses.has(resp.status) && attempt < this.maxRetries) {
-        // Honor Retry-After (seconds) if present.
-        const retryAfter = resp.headers.get("retry-after");
-        let delay = backoffDelayMs(attempt);
-        if (retryAfter) {
-          const parsed = Number(retryAfter);
-          if (Number.isFinite(parsed) && parsed >= 0) {
-            delay = parsed * 1000;
-          }
-        }
-        await resp.body?.cancel().catch(() => undefined);
-        cleanup();
-        await sleep(delay);
+        await sleep(parseRetryAfterMs(resp.headers) ?? backoffDelayMs(attempt), signal);
         attempt += 1;
         continue;
       }
 
-      if (!resp.ok) {
-        cleanup();
-        const { message, errorClass, body: errBody } = await parseErrorResponse(resp);
-        const err = new errorClass(message, resp.status, errBody);
-        err.idempotencyKey = idempotencyKey;
-        throw err;
+      // 409 после повтора самого SDK: первый запрос с этим ключом ещё выполняется
+      // на сервере. Ждём его сохранённый ответ, а не сдаёмся.
+      if (resp.status === 409 && idempotencyKey && attempt > 0 && !stream) {
+        const now = Date.now();
+        conflictDeadline ??= now + CONFLICT_WAIT_BUDGET_MS;
+        if (now < conflictDeadline) {
+          await sleep(Math.min(backoffDelayMs(conflictAttempt), 5_000, conflictDeadline - now), signal);
+          conflictAttempt += 1;
+          continue;
+        }
       }
-      return { response: resp, controller, cleanup };
+
+      if (!resp.ok) throw statusError(resp, text, idempotencyKey);
+      return { response: resp, text, controller, cleanup };
     }
   }
 
@@ -549,15 +694,53 @@ export class NexusClient {
    * Generic typed request helper. Use the public videos/images/tasks/models
    * resources from user code.
    */
-  async _request<T = unknown>(
-    method: string,
-    path: string,
-    opts: RequestOptions = {},
-  ): Promise<T> {
-    const { response } = await this._send(method, path, opts);
-    if (response.status === 204) return undefined as T;
-    const text = await response.text();
-    if (!text) return undefined as T;
-    return JSON.parse(text) as T;
+  async _request<T = unknown>(method: string, path: string, opts: RequestOptions = {}): Promise<T> {
+    const { response, text } = await this._send(method, path, opts);
+    if (response.status === 204 || !text) return undefined as T;
+    try {
+      return JSON.parse(text) as T;
+    } catch {
+      const err = new APIResponseValidationError(
+        `Invalid JSON in HTTP ${response.status} response`,
+        response.status,
+        truncate(text, 2000),
+      );
+      err.headers = headersToObject(response.headers);
+      err.idempotencyKey = opts.extraHeaders?.["Idempotency-Key"];
+      throw err;
+    }
   }
 }
+
+function networkError(
+  e: unknown,
+  ctx: {
+    attempt: number;
+    notSent: boolean;
+    stream: boolean;
+    timedOut: boolean;
+    timeoutMs: number;
+    idempotencyKey?: string;
+  },
+): NetworkError {
+  const reason = ctx.timedOut ? `timed out after ${ctx.timeoutMs}ms` : e instanceof Error ? e.message : String(e);
+  let message: string;
+  if (ctx.notSent) {
+    message = `Could not connect after ${ctx.attempt + 1} attempts: ${reason}`;
+  } else {
+    message = `Network error after ${ctx.attempt + 1} attempts: ${reason}`;
+    if (ctx.stream) {
+      message += ". The request may have reached the server; a streamed response cannot be replayed";
+    } else if (ctx.idempotencyKey) {
+      message +=
+        `. The request reached the server and may still be running (and be charged): repeat it with ` +
+        `idempotencyKey "${ctx.idempotencyKey}", not a new key — once it has finished successfully ` +
+        `the server returns the stored result`;
+    }
+  }
+  const err = new NetworkError(message);
+  err.idempotencyKey = ctx.idempotencyKey;
+  (err as { cause?: unknown }).cause = e;
+  return err;
+}
+

@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Уязвимость
+    url: https://github.com/nexusapi-dev/nexusapi-sdk/security/advisories/new
+    about: Сообщите приватно — не открывайте публичный issue.
+  - name: Документация API
+    url: https://docs.nexusapi.dev
+    about: Модели, параметры, цены и ошибки API.
+  - name: Вопрос по аккаунту, балансу или оплате
+    url: mailto:support@nexusapi.dev
+    about: Не пишите в issue данные аккаунта и API-ключи.

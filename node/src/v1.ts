@@ -3,9 +3,16 @@
  * models, images.generations, videos.
  */
 
-import type { NexusClient } from "./client.js";
-import { TaskFailedError, TaskTimeoutError } from "./errors.js";
-import { compact, generateIdempotencyKey, SAFE_RETRY_STATUSES, sleep } from "./internal.js";
+import type { NexusClient, WaitOptions } from "./client.js";
+import { NexusError, TaskFailedError, TaskTimeoutError } from "./errors.js";
+import {
+  compact,
+  generateIdempotencyKey,
+  isTransientError,
+  SAFE_RETRY_STATUSES,
+  sleep,
+  validateIdempotencyKey,
+} from "./internal.js";
 import { Stream } from "./streaming.js";
 
 // ============================================================
@@ -129,6 +136,8 @@ export interface V1ImageGenerateParams {
   idempotencyKey?: string;
   /** Сколько ждать ответа, мс. По умолчанию не меньше 600000. */
   timeoutMs?: number;
+  /** Отмена запроса. */
+  signal?: AbortSignal;
   /** Native-параметры модели (image_url, negative_prompt, …). */
   [extra: string]: unknown;
 }
@@ -150,6 +159,8 @@ export interface V1VideoCreateParams {
   seed?: number;
   resolution?: string;
   idempotencyKey?: string;
+  /** Отмена запроса. */
+  signal?: AbortSignal;
   /** image_urls, video_urls, audio_urls, webhook_url, negative_prompt, … */
   [extra: string]: unknown;
 }
@@ -192,7 +203,10 @@ export class ChatCompletions {
     if (stream) {
       body.stream = true;
       const extraHeaders: Record<string, string> = { Accept: "text/event-stream" };
-      if (idempotencyKey) extraHeaders["Idempotency-Key"] = idempotencyKey;
+      if (idempotencyKey) {
+        validateIdempotencyKey(idempotencyKey);
+        extraHeaders["Idempotency-Key"] = idempotencyKey;
+      }
       const { response, controller, cleanup } = await this.client._send("POST", "/v1/chat/completions", {
         body,
         extraHeaders,
@@ -240,21 +254,22 @@ export class V1Images {
    * (до 180 с, Seedream Pro до 540 с) и возвращает `{ created, data: [{ url }] }`.
    */
   async generate(params: V1ImageGenerateParams): Promise<ImagesResponse> {
-    const { idempotencyKey, timeoutMs, ...rest } = params;
+    const { idempotencyKey, timeoutMs, signal, ...rest } = params;
     return this.client._request<ImagesResponse>("POST", "/v1/images/generations", {
       body: compact(rest),
       extraHeaders: { "Idempotency-Key": generateIdempotencyKey(idempotencyKey) },
       timeoutMs: this.client._longTimeoutMs(timeoutMs),
       retryStatuses: SAFE_RETRY_STATUSES,
       retrySentErrors: false,
+      signal,
     });
   }
 }
 
-function videoPath(video: string | Pick<VideoObject, "id">): string {
+function videoId(video: string | Pick<VideoObject, "id">): string {
   const id = typeof video === "string" ? video : video?.id;
-  if (!id) throw new Error("video id is required");
-  return `/v1/videos/${encodeURIComponent(id)}`;
+  if (!id) throw new TypeError("video id is required");
+  return id;
 }
 
 export class V1Videos {
@@ -262,48 +277,80 @@ export class V1Videos {
 
   /** POST /v1/videos — создаёт видео (Sora-style), сразу возвращает объект со status "queued". */
   async create(params: V1VideoCreateParams): Promise<VideoObject> {
-    const { idempotencyKey, ...rest } = params;
+    const { idempotencyKey, signal, ...rest } = params;
     return this.client._request<VideoObject>("POST", "/v1/videos", {
       body: compact(rest),
       extraHeaders: { "Idempotency-Key": generateIdempotencyKey(idempotencyKey) },
+      timeoutMs: this.client._generateTimeoutMs(),
+      signal,
     });
   }
 
   /** GET /v1/videos/{id}. У готового видео ссылка в поле `url`. */
-  async retrieve(video: string | Pick<VideoObject, "id">): Promise<VideoObject> {
-    return this.client._request<VideoObject>("GET", videoPath(video));
+  async retrieve(
+    video: string | Pick<VideoObject, "id">,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<VideoObject> {
+    return this.client._request<VideoObject>("GET", `/v1/videos/${encodeURIComponent(videoId(video))}`, {
+      signal: options.signal,
+    });
   }
 
   /**
    * Опрашивает видео до completed. Принимает id или объект из create().
+   * Временные ошибки опроса (сеть, 429, 5xx) пережидает до дедлайна.
    *
-   * @throws TaskTimeoutError если не дождались за timeoutMs
+   * `wait(video, timeoutMs?, pollIntervalMs?)` или `wait(video, { timeoutMs, pollIntervalMs, signal })`.
+   *
+   * @throws TaskTimeoutError если не дождались — видео продолжает генерироваться
    * @throws TaskFailedError если status = "failed" (деньги возвращаются на ключ)
    */
   async wait(
     video: string | Pick<VideoObject, "id">,
-    timeoutMs: number = 600_000,
-    pollIntervalMs: number = 3_000,
+    timeoutOrOptions?: number | WaitOptions,
+    pollIntervalMs?: number,
   ): Promise<VideoObject> {
+    const opts: WaitOptions =
+      typeof timeoutOrOptions === "object" ? timeoutOrOptions : { timeoutMs: timeoutOrOptions, pollIntervalMs };
+    const timeoutMs = opts.timeoutMs ?? 600_000;
+    const interval = opts.pollIntervalMs ?? 3_000;
+    const { signal } = opts;
+    const id = videoId(video);
     const deadline = Date.now() + timeoutMs;
+    let current: Partial<VideoObject> = { id };
     while (true) {
-      const current = await this.retrieve(video);
+      try {
+        current = await this.retrieve(id, { signal });
+      } catch (e) {
+        if (signal?.aborted || !isTransientError(e) || Date.now() >= deadline) {
+          if (e instanceof NexusError) e.taskId = id;
+          throw e;
+        }
+      }
       if (current.status === "failed") {
         const message = current.error?.message;
-        throw new TaskFailedError(`Video ${current.id} failed: ${message ?? "unknown error"}`, {
-          task_id: current.id,
+        const err = new TaskFailedError(`Video ${id} failed: ${message ?? "unknown error"}`, {
+          task_id: id,
           error: message,
           video: current,
         });
+        err.taskId = id;
+        err.task = current;
+        throw err;
       }
-      if (current.status === "completed") return current;
-      if (Date.now() > deadline) {
-        throw new TaskTimeoutError(`Video ${current.id} did not complete within ${timeoutMs}ms`, {
-          task_id: current.id,
-          last_status: current.status,
-        });
+      if (current.status === "completed") return current as VideoObject;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        const err = new TaskTimeoutError(
+          `Video ${id} did not complete within ${timeoutMs}ms (last status: ${current.status}); ` +
+            `it is still running — wait for it again, do not create a new one`,
+          { task_id: id, last_status: current.status },
+        );
+        err.taskId = id;
+        err.task = current;
+        throw err;
       }
-      await sleep(pollIntervalMs);
+      await sleep(Math.min(interval, remaining), signal);
     }
   }
 }

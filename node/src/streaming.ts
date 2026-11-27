@@ -2,7 +2,7 @@
  * SSE (text/event-stream) для chat.completions.create({ stream: true }).
  */
 
-import { NetworkError, StreamError } from "./errors.js";
+import { NetworkError, NexusError, StreamError } from "./errors.js";
 
 const LINE_BREAK = /\r\n|\r|\n/;
 
@@ -109,7 +109,7 @@ export class Stream<T> implements AsyncIterable<T> {
 
   async *[Symbol.asyncIterator](): AsyncIterator<T> {
     if (this.consumed) {
-      throw new Error("Stream can only be iterated once");
+      throw new NexusError("Stream can only be iterated once");
     }
     this.consumed = true;
     const body = this.response.body;

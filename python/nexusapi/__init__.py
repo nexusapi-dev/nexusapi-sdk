@@ -56,6 +56,7 @@ from .client import (
     Task,
 )
 from .errors import (
+    APIResponseValidationError,
     AuthenticationError,
     BillingError,
     ConflictError,
@@ -70,7 +71,7 @@ from .errors import (
     ValidationError,
 )
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 __all__ = [
     # Clients
@@ -92,6 +93,7 @@ __all__ = [
     "NotFoundError",
     "ConflictError",
     "StreamError",
+    "APIResponseValidationError",
     "NexusTimeoutError",
     "TaskFailedError",
     "NetworkError",

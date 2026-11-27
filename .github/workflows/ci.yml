@@ -1,4 +1,6 @@
 # Tests for both SDKs on every push to main and every pull request.
+# Also called by the publish workflows (workflow_call), so a release only
+# goes out when the full matrix is green.
 name: CI
 
 on:
@@ -6,13 +8,14 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   python:
@@ -20,10 +23,11 @@ jobs:
     # setup-python has no Python 3.9 build for the newest ubuntu-latest image
     # (3.9 is end-of-life), so 3.9 jobs run on Ubuntu 24.04.
     runs-on: ${{ matrix.python-version == '3.9' && 'ubuntu-24.04' || 'ubuntu-latest' }}
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
         httpx: [""] # "" = latest
         include:
           # Extra job: oldest supported httpx from pyproject.toml.
@@ -33,10 +37,10 @@ jobs:
       run:
         working-directory: python
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install
@@ -50,41 +54,84 @@ jobs:
         run: python -m pytest -q
 
   python-package:
-    name: Python package build
-    runs-on: ubuntu-latest
+    name: Python package build + typing
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     defaults:
       run:
         working-directory: python
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
-      - run: python -m pip install --upgrade build twine
+      - run: python -m pip install "build>=1.2,<2" "twine>=6,<7" "mypy>=1.10,<2" -e .
+      - name: Type check
+        run: python -m mypy nexusapi
       - run: python -m build
-      - run: python -m twine check dist/*
+      - run: python -m twine check --strict dist/*
 
   node:
     name: Node ${{ matrix.node-version }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
-        node-version: ["18", "20", "22", "24"]
+        node-version: ["18", "20", "22", "24", "26"]
     defaults:
       run:
         working-directory: node
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: ${{ matrix.node-version }}
           cache: npm
           cache-dependency-path: node/package-lock.json
-      - run: npm ci
+      - run: npm ci --ignore-scripts
       - run: npm test
       - run: npm pack --dry-run
+      - name: Lint package (publint)
+        if: matrix.node-version == '22'
+        run: npx --yes publint@0.3.25
+
+  versions:
+    name: Versions in sync
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Python, Node and CHANGELOG agree
+        run: |
+          PY=$(grep -E '^version\s*=' python/pyproject.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+          PY_INIT=$(grep -E '^__version__' python/nexusapi/__init__.py | sed -E 's/.*"([^"]+)".*/\1/')
+          NODE=$(node -p "require('./node/package.json').version")
+          LOCK=$(node -p "require('./node/package-lock.json').version")
+          TS=$(grep -E 'export const VERSION' node/src/client.ts | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "pyproject=$PY __init__=$PY_INIT package.json=$NODE lock=$LOCK VERSION=$TS"
+          for v in "$PY_INIT" "$NODE" "$LOCK" "$TS"; do
+            [ "$v" = "$PY" ] || { echo "::error::Versions differ"; exit 1; }
+          done
+          grep -qE "^## $PY( |$)" CHANGELOG.md || { echo "::error::CHANGELOG.md has no '## $PY' section"; exit 1; }
+
+  # Single required status check for branch protection.
+  ci-ok:
+    name: CI OK
+    if: always()
+    needs: [python, python-package, node, versions]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: All jobs passed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "$RESULTS"
+          for r in $RESULTS; do [ "$r" = "success" ] || exit 1; done

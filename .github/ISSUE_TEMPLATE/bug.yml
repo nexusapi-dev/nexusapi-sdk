@@ -1,0 +1,33 @@
+name: Ошибка в SDK
+description: SDK ведёт себя не так, как описано
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Не вставляйте API-ключ и личные данные. Ключ в логах можно заменить на `***`.
+  - type: dropdown
+    id: sdk
+    attributes:
+      label: SDK
+      options: [Python, Node.js]
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Версия SDK и рантайма
+      placeholder: nexusapi-sdk 0.3.1, Python 3.12 / Node 22
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: Что произошло и что ожидали
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Как воспроизвести
+      description: Минимальный код. Если есть task_id или idempotency_key — укажите.
+      render: text

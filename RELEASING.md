@@ -15,7 +15,8 @@
 ```bash
 # 1. Версия: python/pyproject.toml + python/nexusapi/__init__.py (__version__)
 #    и node/package.json + node/package-lock.json + VERSION в node/src/client.ts
-# 2. Запись в CHANGELOG.md
+#    (CI-задача «Versions in sync» проверяет, что везде одинаково)
+# 2. Запись «## <версия> — <дата>» в CHANGELOG.md
 # 3. Коммит в main, CI зелёный
 git commit -am "Release 0.3.1"
 git push origin main
@@ -26,9 +27,16 @@ git tag node-sdk-v0.3.1
 git push origin python-sdk-v0.3.1 node-sdk-v0.3.1
 ```
 
-Workflow проверяет, что тег совпадает с версией пакета, гоняет тесты,
-собирает пакет и публикует. У npm-пакета появится provenance («Built and signed
-on GitHub Actions»), у PyPI — attestations.
+Каждый workflow публикации:
+1. запускает полный CI (`ci.yml`: все версии Python и Node, сверка версий);
+2. проверяет, что тег совпадает с версией пакета и что коммит есть в `main`;
+3. собирает пакет в задаче без права публикации;
+4. ждёт подтверждения в окружении `pypi` / `npm` (Actions → запуск →
+   **Review deployments → Approve**) и публикует собранный пакет.
+
+У npm-пакета будет provenance («Built and signed on GitHub Actions»), у PyPI —
+attestations. Теги `python-sdk-v*` / `node-sdk-v*` может создать только админ
+репозитория.
 
 **Проверка без публикации:** Actions → нужный workflow → «Run workflow».
 Ручной запуск только собирает и проверяет пакет, ничего не загружает.
