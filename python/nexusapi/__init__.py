@@ -7,7 +7,7 @@ Quickstart — sync:
 
     from nexusapi import NexusClient
 
-    with NexusClient(api_key="...") as client:
+    with NexusClient() as client:  # ключ из NEXUSAPI_API_KEY
         # Image (built-in polling)
         img = client.images.generate(model="nano-banana", prompt="a cat")
         print(img.image_url)
@@ -47,19 +47,25 @@ Quickstart — async:
 
     asyncio.run(main())
 """
+from . import types, webhooks
 from .client import (
+    NOT_GIVEN,
     AsyncNexusClient,
     AsyncStream,
     AsyncTask,
     NexusClient,
+    NotGiven,
     Stream,
     Task,
 )
 from .errors import (
     APIResponseValidationError,
+    APIStatusError,
+    APITimeoutError,
     AuthenticationError,
     BillingError,
     ConflictError,
+    InternalServerError,
     NetworkError,
     NexusError,
     NotFoundError,
@@ -69,22 +75,29 @@ from .errors import (
     TaskFailedError,
     TimeoutError as NexusTimeoutError,
     ValidationError,
+    WebhookVerificationError,
 )
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 
 __all__ = [
     # Clients
     "NexusClient",
     "AsyncNexusClient",
+    "NOT_GIVEN",
+    "NotGiven",
     # Task objects
     "Task",
     "AsyncTask",
     # Chat streams
     "Stream",
     "AsyncStream",
+    # Modules
+    "types",
+    "webhooks",
     # Errors
     "NexusError",
+    "APIStatusError",
     "AuthenticationError",
     "BillingError",
     "NexusPermissionError",
@@ -92,9 +105,12 @@ __all__ = [
     "ValidationError",
     "NotFoundError",
     "ConflictError",
+    "InternalServerError",
+    "NetworkError",
+    "APITimeoutError",
     "StreamError",
     "APIResponseValidationError",
     "NexusTimeoutError",
     "TaskFailedError",
-    "NetworkError",
+    "WebhookVerificationError",
 ]
