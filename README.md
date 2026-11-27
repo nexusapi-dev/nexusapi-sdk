@@ -9,8 +9,8 @@
 
 | Язык | Пакет | Каталог | Установка |
 |---|---|---|---|
-| Python 3.9+ | [![PyPI](https://img.shields.io/pypi/v/nexusapi-sdk)](https://pypi.org/project/nexusapi-sdk/) | [`python/`](python/) | `pip install nexusapi-sdk` |
-| Node.js 18+ / TypeScript | [![npm](https://img.shields.io/npm/v/nexusapi-sdk)](https://www.npmjs.com/package/nexusapi-sdk) | [`node/`](node/) | `npm install nexusapi-sdk` |
+| Python 3.10+ | [![PyPI](https://img.shields.io/pypi/v/nexusapi-sdk)](https://pypi.org/project/nexusapi-sdk/) | [`python/`](python/) | `pip install nexusapi-sdk` |
+| Node.js 20+ / TypeScript | [![npm](https://img.shields.io/npm/v/nexusapi-sdk)](https://www.npmjs.com/package/nexusapi-sdk) | [`node/`](node/) | `npm install nexusapi-sdk` |
 
 Оба SDK умеют:
 
@@ -21,12 +21,15 @@
   `client.v1.videos.create(...)` / `retrieve` / `wait`;
 - повторы при 429/5xx/сетевых ошибках и автоматический `Idempotency-Key`,
   чтобы повтор не создал вторую задачу и второе списание;
-- типизированные ошибки (`BillingError`, `RateLimitError`, `ValidationError`, ...).
+- проверку подписи вебхуков (`client.webhooks.unwrap`);
+- типизированные ошибки с `request_id` (`BillingError`, `RateLimitError`,
+  `ValidationError`, ...) и типы ответов;
+- настройку через переменные окружения `NEXUSAPI_API_KEY` / `NEXUSAPI_BASE_URL`.
 
 ```python
 from nexusapi import NexusClient
 
-with NexusClient(api_key="ВАШ_КЛЮЧ") as client:
+with NexusClient() as client:  # ключ из NEXUSAPI_API_KEY
     reply = client.chat.completions.create(
         model="claude-sonnet-5",
         messages=[{"role": "user", "content": "Привет!"}],
@@ -37,7 +40,7 @@ with NexusClient(api_key="ВАШ_КЛЮЧ") as client:
 ```ts
 import { NexusClient } from "nexusapi-sdk";
 
-const client = new NexusClient({ apiKey: process.env.NEXUS_KEY! });
+const client = new NexusClient(); // ключ из NEXUSAPI_API_KEY
 const task = await client.videos.create({ model: "veo-3-fast", prompt: "Кот играет на пианино", duration: 8 });
 await task.wait();
 console.log(task.videoUrl);
@@ -70,12 +73,12 @@ cd node && npm ci && npm test
 
 | | Поддерживается | Тестируется в CI |
 |---|---|---|
-| Python | 3.9+ | 3.9–3.14 |
-| Node.js | 18+ | 18, 20, 22, 24, 26 |
+| Python | 3.10+ | 3.10–3.14 |
+| Node.js | 20+ (ESM и CommonJS) | 20, 22, 24, 26 |
 
-Python 3.9, Node 18 и Node 20 уже без поддержки от своих сообществ; их
-планируем убрать в 0.4.0. Исправления безопасности выходят для последней
-минорной версии.
+Версию рантайма убираем в следующей минорной версии SDK после того, как у неё
+заканчивается поддержка от сообщества (Python 3.10 и Node 20 — кандидаты в
+0.5.0). Исправления безопасности выходят для последней минорной версии.
 
 ## Лицензия
 

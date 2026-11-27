@@ -10,15 +10,24 @@
 pip install nexusapi-sdk
 ```
 
+Требуется Python 3.10+.
+
 > Пакет на PyPI называется `nexusapi-sdk` (имя `nexusapi` зарезервировано
 > похожим проектом). Импорт остаётся `from nexusapi import ...`.
+
+Ключ API создаётся в [panel.nexusapi.dev](https://panel.nexusapi.dev). Удобнее
+всего положить его в переменную окружения — тогда в коде его не будет:
+
+```bash
+export NEXUSAPI_API_KEY="..."
+```
 
 ## Quickstart — sync
 
 ```python
 from nexusapi import NexusClient
 
-with NexusClient(api_key="ВАШ_КЛЮЧ") as client:  # создать в panel.nexusapi.dev
+with NexusClient() as client:  # ключ из NEXUSAPI_API_KEY (или NexusClient(api_key=...))
     # Изображение (sync — SDK сам опрашивает статус)
     img = client.images.generate(
         model="nano-banana",
@@ -46,7 +55,7 @@ import asyncio
 from nexusapi import AsyncNexusClient
 
 async def main():
-    async with AsyncNexusClient(api_key="ВАШ_КЛЮЧ") as client:
+    async with AsyncNexusClient() as client:
         task = await client.videos.create(
             model="veo-3-fast",
             prompt="Кот играет на пианино",
@@ -134,6 +143,67 @@ print(video["url"])
 
 `client.v1.chat` — тот же объект, что и `client.chat`.
 
+## Настройки клиента
+
+```python
+import httpx
+from nexusapi import NexusClient
+
+client = NexusClient(
+    api_key="...",                       # по умолчанию NEXUSAPI_API_KEY
+    base_url="https://nexusapi.dev",     # по умолчанию NEXUSAPI_BASE_URL
+    timeout=60,                          # секунды или httpx.Timeout
+    max_retries=2,                       # повторы при 429/5xx/сетевых ошибках
+    default_headers={"X-Team": "media"}, # заголовки каждого запроса
+    http_client=httpx.Client(proxy="http://proxy:3128"),  # прокси, TLS, лимиты
+)
+
+# Разовые настройки — копия клиента на том же пуле соединений
+client.with_options(timeout=10, max_retries=0).tasks.get(task_id)
+```
+
+Свой `http_client` SDK не закрывает — это делает тот, кто его создал. Таймаут
+и повторы при этом берутся из настроек SDK.
+
+## Вебхуки и проверка подписи
+
+Передайте `webhook_url` при создании задачи — когда она завершится, NexusAPI
+пришлёт POST с телом `{"task_id", "status", "result", "error"}` и подписью в
+заголовках `X-Nexus-Timestamp` / `X-Nexus-Signature`. Проверяйте подпись по
+**сырому** телу запроса:
+
+```python
+from fastapi import FastAPI, HTTPException, Request
+from nexusapi import NexusClient, WebhookVerificationError
+
+app = FastAPI()
+client = NexusClient()
+
+@app.post("/nexus-callback")
+async def nexus_callback(request: Request):
+    body = await request.body()  # сырые байты, не request.json()
+    try:
+        event = client.webhooks.unwrap(body, request.headers)
+    except WebhookVerificationError:
+        raise HTTPException(400, "bad signature")
+    if event["status"] == "completed":
+        save_result(event["task_id"], event["result"])
+    return {"ok": True}
+```
+
+`client.webhooks.unwrap` вычисляет секрет из ключа клиента. Если сервис,
+принимающий вебхуки, не должен знать API-ключ, получите секрет один раз
+(`client.webhooks.secret()` → `whsec_…`) и проверяйте им:
+
+```python
+from nexusapi import webhooks
+
+event = webhooks.unwrap(body, request.headers, secret=WEBHOOK_SECRET)
+```
+
+Подпись старше 5 минут отклоняется (`tolerance=` меняет допуск) — так
+перехваченный запрос нельзя прислать повторно.
+
 ## Возможности
 
 - **Sync (`NexusClient`) и async (`AsyncNexusClient`)** — одинаковый API,
@@ -144,22 +214,23 @@ print(video["url"])
   (секунды, HTTP-дата, `retry-after-ms`; больше 60 с не ждёт). Настраивается
   через `max_retries=N`. Повторы пишутся в логгер `nexusapi` на уровне INFO.
 - **Auto Idempotency-Key** — для каждого POST автоматически генерируется
-  UUID v4, если не передан свой (8–256 символов). Повтор самого SDK с тем же
-  ключом не создаёт вторую задачу; если повтор получил 409 «первый запрос ещё
-  выполняется», SDK ждёт до 2 минут его сохранённый ответ. Для стрима чата ключ
-  уходит только если передан явно, а повтор делается только когда запрос не
-  дошёл до сервера.
-- **Что делать после ошибки.** У каждой ошибки есть `idempotency_key`.
-  - `NetworkError`, `ConflictError`, 4xx: повторяйте с тем же ключом, а не с
-    новым — если первый запрос выполнился, сервер вернёт его результат.
-  - 5xx: сервер ответ не сохраняет, запрос мог быть оплачен. Проверьте
-    результат (`client.tasks.get`) прежде чем повторять.
-  - Стрим чата повторить нельзя: сервер не сохраняет его результат.
+  UUID v4, если не передан свой (8–256 символов). Генерации (`/generate`,
+  `/v1/images`, `/v1/videos`) сервер привязывает к ключу: повтор с тем же
+  ключом — после 5xx, таймаута или обрыва — возвращает ту же задачу и не
+  списывает деньги второй раз. Если повтор получил 409 «первый запрос ещё
+  выполняется», SDK ждёт до 2 минут его ответ.
+- **Что делать после ошибки.** У каждой ошибки есть `idempotency_key` и
+  `request_id`.
+  - Генерации: повторяйте с тем же `idempotency_key`, а не с новым — сервер
+    вернёт ту же задачу. 504 у `v1.images.generate` несёт `task_id`: задачу
+    можно дождаться через `client.tasks.get(err.task_id).wait()`.
+  - Чат: сервер хранит только успешный ответ — после 5xx повтор вызовет
+    модель снова (500 SDK поэтому сам не повторяет).
+  - Стрим чата повторить нельзя: сервер его не сохраняет.
+  - В поддержку пишите с `request_id` — по нему находят запрос в логах.
 - **Долгие запросы** — `POST /generate` ждёт ответа не меньше 120 с (часть
   моделей до ответа проверяет входные файлы), `chat.completions` и
-  `v1.images.generate` — не меньше 600 с (аргумент `timeout=`). Ответы 500,
-  502 и 504 долгих запросов и обрыв уже отправленного запроса SDK не
-  повторяет: задача могла уже начаться, и повтор оплатил бы её второй раз.
+  `v1.images.generate` — не меньше 600 с (аргумент `timeout=`).
 - **Ожидание задач** — `task.wait()` и `client.v1.videos.wait()` пережидают
   временные ошибки опроса (сеть, 429, 5xx). Если время вышло, задача
   продолжает идти: `NexusTimeoutError` несёт `.task_id` и `.task` — дождитесь
@@ -169,14 +240,21 @@ print(video["url"])
   `image_url`, `cfg_scale`, `video_urls` для seedance, `source_video_url` для veo-extend,
   и т.д. Передаются прямо в `create()`/`generate()`.
 - **Auto-polling** для image-моделей (sync UX). Для видео — `task.wait()`.
-- **Типизированные ошибки** — `NexusError` (база), `BillingError`,
-  `RateLimitError`, `ValidationError`, `NotFoundError`, `AuthenticationError`,
-  `NexusPermissionError`, `NexusTimeoutError` (client-side wait timeout),
-  `TaskFailedError` (провайдер не справился), `NetworkError` (retries исчерпаны),
-  `ConflictError` (409: запрос с этим Idempotency-Key ещё выполняется),
-  `StreamError` (ошибка внутри SSE-стрима), `APIResponseValidationError`
-  (ответ не JSON или без нужного поля). У ошибок есть `status_code`,
-  `headers`, `response_body`, `idempotency_key`, у ошибок ожидания — `task_id`.
+- **Типизированные ошибки** — все наследуют `NexusError`:
+  - `APIStatusError` — любой HTTP-ответ с ошибкой; подклассы
+    `ValidationError` (400/422), `AuthenticationError` (401), `BillingError`
+    (402), `NexusPermissionError` (403), `NotFoundError` (404), `ConflictError`
+    (409), `RateLimitError` (429), `InternalServerError` (5xx);
+  - `NetworkError` (ответа нет) и его подкласс `APITimeoutError`;
+  - `APIResponseValidationError` (ответ не JSON или без нужного поля),
+    `StreamError` (ошибка внутри стрима), `NexusTimeoutError` (не дождались
+    задачи), `TaskFailedError` (задача упала), `WebhookVerificationError`.
+
+  Поля: `status_code`, `headers`, `response_body`, `request_id`, `code`,
+  `type`, `param`, `idempotency_key`, у ошибок про задачу — `task_id`.
+- **Типы** — ответы описаны в `nexusapi.types` (TypedDict: `ChatCompletion`,
+  `Video`, `ImagesResponse`, …); пакет проходит `mypy --strict`. Во время
+  выполнения это обычные dict.
 - **Context manager** — `with NexusClient(...) as c:` / `async with AsyncNexusClient(...) as c:`
   закрывает HTTP-соединение автоматически.
 
@@ -191,19 +269,11 @@ task = client.videos.create(
     duration=8,
     webhook_url="https://your-app.com/nexus-callback",
 )
-# Не вызываем .wait() — NexusAPI POST'нет на webhook_url когда видео готово
+# Не вызываем .wait() — NexusAPI пришлёт подписанный POST, когда видео готово
 return task.id  # сохраним в БД, дождёмся колбэка
 ```
 
-Вебхук не подписан: POST на ваш адрес может прислать кто угодно. Считайте его
-только сигналом и берите результат из API:
-
-```python
-def on_nexus_callback(payload: dict) -> None:
-    task = client.tasks.get(payload["task_id"])  # источник правды — API
-    if task.status == "completed":
-        save_result(task.id, task.video_url)
-```
+Как проверить подпись вебхука — в разделе «Вебхуки и проверка подписи».
 
 ### Image-to-video (Kling motion)
 
@@ -241,16 +311,21 @@ print(task.result)           # сырой dict с провайдер-специ�
 ### Обработка ошибок
 
 ```python
-from nexusapi import NexusClient, BillingError, RateLimitError, ValidationError
+from nexusapi import APIStatusError, BillingError, NetworkError, RateLimitError, ValidationError
 
 try:
     task = client.videos.create(model="veo-3-fast", prompt="...", duration=8).wait()
 except BillingError:
-    print("Недостаточно средств — пополни баланс в боте")
+    print("Недостаточно средств — пополните баланс")
 except RateLimitError:
-    print("Превышен rate-limit ключа — подожди минуту")
+    print("Превышен rate-limit ключа — подождите минуту")
 except ValidationError as e:
     print(f"Невалидные параметры: {e}")
+except APIStatusError as e:
+    print(f"Ошибка API {e.status_code}, request_id={e.request_id}")
+except NetworkError as e:
+    # повторять — с тем же ключом: сервер вернёт ту же задачу
+    print(f"Нет ответа; повторите с idempotency_key={e.idempotency_key}")
 ```
 
 ### Каталог моделей

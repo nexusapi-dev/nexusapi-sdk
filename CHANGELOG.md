@@ -3,6 +3,46 @@
 Версии Python (`nexusapi-sdk` на PyPI) и Node (`nexusapi-sdk` на npm) выходят
 вместе и с одинаковыми номерами. [SemVer](https://semver.org/).
 
+## 0.4.0 — 2026-11-28
+
+### Миграция с 0.3.x
+
+- **Python ≥ 3.10, Node.js ≥ 20.** Python 3.9 и Node 18 больше не
+  поддерживаются (у обоих закончилась поддержка от сообщества).
+- **Python, типы:** ответы `/v1` и `models.list()` описаны TypedDict
+  (`nexusapi.types`). Во время выполнения это те же dict; но аннотация
+  `x: dict = client.chat.completions.create(...)` под mypy теперь ошибка —
+  используйте `ChatCompletion` или `Mapping[str, Any]`.
+- **Повторы:** сервер теперь привязывает Idempotency-Key к задаче, поэтому SDK
+  повторяет с тем же ключом то, что раньше не повторял: 5xx и обрыв у
+  `v1.images.generate`, 502/504 и обрыв у чата. Второго списания это не
+  создаёт. 500 у чата по-прежнему не повторяется.
+- Иерархия ошибок расширена, но совместима: всё по-прежнему `NexusError`, а
+  HTTP-ошибки теперь ещё и `APIStatusError`.
+
+### Добавлено
+
+- Ключ и адрес API из переменных окружения `NEXUSAPI_API_KEY` и
+  `NEXUSAPI_BASE_URL`: `NexusClient()` без аргументов.
+- `default_headers` / `defaultHeaders`; Python — `http_client=` (свой
+  httpx-клиент: прокси, TLS, лимиты).
+- `with_options(...)` / `withOptions(...)` — копия клиента с другим
+  таймаутом, числом повторов и заголовками. Node: второй аргумент
+  `{ signal, timeoutMs, maxRetries, headers }` у каждого метода.
+- Ошибки: `APIStatusError` (база HTTP-ошибок), `InternalServerError` (5xx),
+  `APITimeoutError` (подкласс `NetworkError`), `WebhookVerificationError`;
+  поля `request_id` / `requestId` (из `X-Request-Id`), `code`, `type`, `param`;
+  у 504 от `/v1/images` — `task_id` / `taskId` задачи, которая ещё идёт.
+- Вебхуки: проверка подписи `X-Nexus-Signature` (HMAC-SHA256 + timestamp):
+  `client.webhooks.unwrap(body, headers)`, `client.webhooks.secret()`, отдельные
+  функции `nexusapi.webhooks.unwrap/verify_signature` (Python) и
+  `unwrapWebhook/verifyWebhookSignature/webhookSecretFromApiKey` (Node).
+- Python: типы ответов `nexusapi.types`, пакет проходит `mypy --strict`;
+  `Task` сериализуется pickle (без клиента); User-Agent с версией Python.
+- Node: сборки ESM и CommonJS (`require("nexusapi-sdk")`), проверены
+  arethetypeswrong и publint; работает под браузер/edge без `node:` импортов;
+  User-Agent с версией Node.
+
 ## 0.3.1 — 2026-11-28
 
 Исправления надёжности по аудиту; публичный интерфейс 0.3.0 не меняется.
