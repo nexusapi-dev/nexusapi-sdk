@@ -17,7 +17,9 @@ concurrency:
 jobs:
   python:
     name: Python ${{ matrix.python-version }}${{ matrix.httpx && format(' / httpx {0}', matrix.httpx) || '' }}
-    runs-on: ubuntu-latest
+    # setup-python has no Python 3.9 build for the newest ubuntu-latest image
+    # (3.9 is end-of-life), so 3.9 jobs run on Ubuntu 24.04.
+    runs-on: ${{ matrix.python-version == '3.9' && 'ubuntu-24.04' || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:
