@@ -1,0 +1,81 @@
+# Publishes python/ to PyPI as `nexusapi-sdk` when a tag python-sdk-v<VERSION>
+# is pushed (for example python-sdk-v0.3.0).
+#
+# Uses PyPI Trusted Publishing (OIDC): no API token is stored in GitHub.
+# One-time setup on PyPI — project nexusapi-sdk → Settings → Publishing →
+# add a GitHub publisher with this repository, workflow `publish-python.yml`
+# and environment `pypi`. See RELEASING.md.
+#
+# Manual run (Actions → Run workflow) only builds and checks, never uploads.
+name: Publish Python SDK
+
+on:
+  push:
+    tags:
+      - "python-sdk-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: python
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Verify tag matches pyproject version
+        if: github.event_name == 'push'
+        run: |
+          TAG_VERSION="${GITHUB_REF#refs/tags/python-sdk-v}"
+          PKG_VERSION=$(grep -E '^version\s*=' pyproject.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "Tag: $TAG_VERSION  Package: $PKG_VERSION"
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::Tag version ($TAG_VERSION) != pyproject.toml version ($PKG_VERSION)"
+            exit 1
+          fi
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Test
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m pip install -e ".[test]"
+          python -m pytest -q
+
+      - name: Build wheel + sdist
+        run: |
+          rm -rf dist build
+          python -m build
+
+      - name: Twine check
+        run: python -m twine check dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-dist
+          path: python/dist/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/nexusapi-sdk/
+    permissions:
+      id-token: write # Trusted Publishing + attestations
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: python-dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1

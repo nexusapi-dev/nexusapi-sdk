@@ -1,0 +1,21 @@
+.DS_Store
+.env
+.env.*
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+.pytest_cache/
+.mypy_cache/
+python/build/
+python/dist/
+
+# Node
+node_modules/
+node/dist/
+*.tsbuildinfo
+*.tgz

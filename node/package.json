@@ -1,0 +1,68 @@
+{
+  "name": "nexusapi-sdk",
+  "version": "0.3.0",
+  "description": "Node.js / TypeScript SDK for NexusAPI — video, image and text models through a single API (Veo, Kling, Seedance, Nano-Banana, Claude, GPT). OpenAI-compatible /v1 with streaming. Auto-retries, auto idempotency.",
+  "keywords": [
+    "ai",
+    "video",
+    "image",
+    "generation",
+    "veo",
+    "kling",
+    "seedance",
+    "nano-banana",
+    "llm",
+    "chat",
+    "claude",
+    "gpt",
+    "sora",
+    "openai-compatible",
+    "idempotency-key",
+    "nexusapi"
+  ],
+  "homepage": "https://nexusapi.dev",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nexusapi-dev/nexusapi-sdk.git",
+    "directory": "node"
+  },
+  "bugs": {
+    "url": "https://github.com/nexusapi-dev/nexusapi-sdk/issues"
+  },
+  "author": {
+    "name": "NexusAPI",
+    "email": "support@nexusapi.dev",
+    "url": "https://nexusapi.dev"
+  },
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test tests/*.test.js"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

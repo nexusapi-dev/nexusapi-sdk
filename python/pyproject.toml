@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nexusapi-sdk"
+version = "0.3.0"
+description = "Python SDK для NexusAPI — видео, изображения и текстовые модели через единый API (Veo, Kling, Seedance, Nano-Banana, Claude, GPT). OpenAI-совместимый /v1 со стримингом, sync + async, auto-retries, auto idempotency."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [{ name = "NexusAPI", email = "support@nexusapi.dev" }]
+keywords = [
+    "ai", "video", "image", "generation", "llm", "chat",
+    "veo", "kling", "seedance", "nano-banana", "claude", "gpt",
+    "sora", "openai-compatible", "idempotency-key",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Graphics",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+dependencies = [
+    "httpx >= 0.24",
+]
+
+[project.optional-dependencies]
+test = ["pytest >= 7", "pytest-asyncio >= 0.21"]
+
+[project.urls]
+Homepage = "https://nexusapi.dev"
+Documentation = "https://docs.nexusapi.dev"
+Repository = "https://github.com/nexusapi-dev/nexusapi-sdk"
+Issues = "https://github.com/nexusapi-dev/nexusapi-sdk/issues"
+
+[tool.setuptools.packages.find]
+include = ["nexusapi*"]
+
+[tool.setuptools.package-data]
+nexusapi = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
