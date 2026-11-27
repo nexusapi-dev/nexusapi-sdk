@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import {
   ConflictError,
+  InternalServerError,
   NetworkError,
   NexusClient,
   NexusError,
@@ -101,12 +102,12 @@ async function collect(stream) {
 // Общее
 // ============================================================
 
-describe("0.3.0 basics", () => {
+describe("basics", () => {
   it("VERSION matches package.json and goes into User-Agent", async () => {
     assert.equal(VERSION, PKG.version);
     const { fetchMock, calls } = mockFetch(() => json(200, { object: "list", data: [] }));
     await client(fetchMock).v1.models.list();
-    assert.equal(calls[0].headers["User-Agent"], `nexusapi-node/${PKG.version}`);
+    assert.equal(calls[0].headers["User-Agent"], `nexusapi-node/${PKG.version} node/${process.versions.node}`);
   });
 
   it("v1.chat is the same object as chat", () => {
@@ -151,7 +152,7 @@ describe("chat.completions.create", () => {
 
   it("uses the user idempotencyKey and keeps it across retries", async () => {
     const { fetchMock, calls } = mockFetch((_, n) =>
-      n === 1 ? json(503, { error: { message: "busy" } }, { "retry-after": "0" }) : json(200, COMPLETION),
+      n === 1 ? json(502, { error: { message: "busy" } }, { "retry-after": "0" }) : json(200, COMPLETION),
     );
     await client(fetchMock, { maxRetries: 2 }).chat.completions.create({
       model: "m",
@@ -163,14 +164,18 @@ describe("chat.completions.create", () => {
     assert.equal(calls[1].headers["Idempotency-Key"], "my-key-123");
   });
 
-  for (const status of [500, 502, 504]) {
-    it(`does not retry ${status} (paid work may already run)`, async () => {
+  // Чат: 502/504 повторяем (прокси, сервер ещё работает). 500 — нет: он мог
+  // прийти после вызова модели. 503 — нет: повтор снова отправил бы запрос
+  // платному поставщику модели.
+  for (const [status, expected] of [[500, 1], [502, 3], [503, 1], [504, 3]]) {
+    it(`chat: HTTP ${status} → ${expected} attempt(s), same key`, async () => {
       const { fetchMock, calls } = mockFetch(() => json(status, { error: { message: "x" } }, { "retry-after": "0" }));
       await assert.rejects(
-        client(fetchMock, { maxRetries: 3 }).chat.completions.create({ model: "m", messages: [] }),
+        client(fetchMock, { maxRetries: 2 }).chat.completions.create({ model: "m", messages: [] }),
         (e) => e instanceof NexusError && e.status === status,
       );
-      assert.equal(calls.length, 1);
+      assert.equal(calls.length, expected);
+      assert.equal(new Set(calls.map((c) => c.headers["Idempotency-Key"])).size, 1);
     });
   }
 
@@ -384,15 +389,24 @@ describe("v1 resources", () => {
     assert.match(calls[0].headers["Idempotency-Key"], /^sdk-/);
   });
 
-  it("v1.images.generate does not retry 504 (task still running)", async () => {
+  it("v1.images.generate: 504 retries with the same key; final error carries task_id", async () => {
     const { fetchMock, calls } = mockFetch(() =>
-      json(504, { error: { message: "Task did not complete within 180s", type: "timeout_error" } }, { "retry-after": "0" }),
+      json(
+        504,
+        { error: { message: "Task t-9 did not complete within 180s", type: "timeout_error", task_id: "t-9" } },
+        { "retry-after": "0", "x-request-id": "req_abc" },
+      ),
     );
-    await assert.rejects(
-      client(fetchMock, { maxRetries: 3 }).v1.images.generate({ model: "m", prompt: "p" }),
-      (e) => e.status === 504,
-    );
-    assert.equal(calls.length, 1);
+    await assert.rejects(client(fetchMock, { maxRetries: 2 }).v1.images.generate({ model: "m", prompt: "p" }), (e) => {
+      assert.ok(e instanceof InternalServerError);
+      assert.equal(e.status, 504);
+      assert.equal(e.taskId, "t-9");
+      assert.equal(e.type, "timeout_error");
+      assert.equal(e.requestId, "req_abc");
+      return true;
+    });
+    assert.equal(calls.length, 3);
+    assert.equal(new Set(calls.map((c) => c.headers["Idempotency-Key"])).size, 1);
   });
 
   it("v1.videos.create → wait → completed", async () => {
@@ -458,7 +472,7 @@ describe("v1 resources", () => {
 import { getEventListeners } from "node:events";
 
 describe("after-send failures and cancellation", () => {
-  it("long requests are not retried after send; error carries the key", async () => {
+  it("after-send failures are retried with the same key; error carries the key", { timeout: 10_000 }, async () => {
     for (const call of [
       (c) => c.chat.completions.create({ model: "m", messages: [] }),
       (c) => c.v1.images.generate({ model: "m", prompt: "p" }),
@@ -466,13 +480,14 @@ describe("after-send failures and cancellation", () => {
       const { fetchMock, calls } = mockFetch(() => {
         throw new TypeError("fetch failed", { cause: { code: "UND_ERR_HEADERS_TIMEOUT" } });
       });
-      await assert.rejects(call(client(fetchMock, { maxRetries: 3 })), (e) => {
+      await assert.rejects(call(client(fetchMock, { maxRetries: 1 })), (e) => {
         assert.ok(e instanceof NetworkError);
         assert.equal(e.idempotencyKey, calls[0].headers["Idempotency-Key"]);
         assert.ok(e.message.includes(e.idempotencyKey));
         return true;
       });
-      assert.equal(calls.length, 1);
+      assert.equal(calls.length, 2);
+      assert.equal(new Set(calls.map((c) => c.headers["Idempotency-Key"])).size, 1);
     }
   });
 

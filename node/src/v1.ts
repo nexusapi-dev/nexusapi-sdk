@@ -3,12 +3,18 @@
  * models, images.generations, videos.
  */
 
-import type { NexusClient, WaitOptions } from "./client.js";
+import type { NexusClient, RequestOptions, WaitOptions } from "./client.js";
 import { NexusError, TaskFailedError, TaskTimeoutError } from "./errors.js";
 import {
+  CHAT_RETRY_STATUSES,
+  CHAT_RETRY_WINDOW_MS,
   compact,
-  generateIdempotencyKey,
+  deadlineFrom,
+  getHeader,
+  IMAGES_RETRY_STATUSES,
   isTransientError,
+  requestTransport,
+  resolveIdempotencyKey,
   SAFE_RETRY_STATUSES,
   sleep,
   validateIdempotencyKey,
@@ -191,26 +197,42 @@ export class ChatCompletions {
   constructor(private readonly client: NexusClient) {}
 
   /** POST /v1/chat/completions. С `stream: true` — Stream<ChatCompletionChunk>. */
-  create(params: ChatCompletionCreateParams & { stream: true }): Promise<Stream<ChatCompletionChunk>>;
-  create(params: ChatCompletionCreateParams & { stream?: false | undefined }): Promise<ChatCompletion>;
-  create(params: ChatCompletionCreateParams): Promise<ChatCompletion | Stream<ChatCompletionChunk>>;
+  create(
+    params: ChatCompletionCreateParams & { stream: true },
+    options?: RequestOptions,
+  ): Promise<Stream<ChatCompletionChunk>>;
+  create(
+    params: ChatCompletionCreateParams & { stream?: false | undefined },
+    options?: RequestOptions,
+  ): Promise<ChatCompletion>;
+  create(
+    params: ChatCompletionCreateParams,
+    options?: RequestOptions,
+  ): Promise<ChatCompletion | Stream<ChatCompletionChunk>>;
   async create(
     params: ChatCompletionCreateParams,
+    options: RequestOptions = {},
   ): Promise<ChatCompletion | Stream<ChatCompletionChunk>> {
-    const { stream, idempotencyKey, timeoutMs, signal, ...rest } = params;
+    const { stream, idempotencyKey, timeoutMs: paramsTimeout, signal: paramsSignal, ...rest } = params;
     const body = compact(rest);
-    const requestTimeout = this.client._longTimeoutMs(timeoutMs);
+    const explicitTimeout = options.timeoutMs ?? paramsTimeout;
+    const requestTimeout = this.client._longTimeoutMs(explicitTimeout);
+    const deadlineMs = deadlineFrom(explicitTimeout);
+    const signal = options.signal ?? paramsSignal;
     if (stream) {
       body.stream = true;
-      const extraHeaders: Record<string, string> = { Accept: "text/event-stream" };
-      if (idempotencyKey) {
-        validateIdempotencyKey(idempotencyKey);
-        extraHeaders["Idempotency-Key"] = idempotencyKey;
+      const extraHeaders: Record<string, string> = { ...options.headers, Accept: "text/event-stream" };
+      const streamKey = idempotencyKey ?? getHeader(options.headers, "Idempotency-Key");
+      if (streamKey) {
+        validateIdempotencyKey(streamKey);
+        extraHeaders["Idempotency-Key"] = streamKey;
       }
       const { response, controller, cleanup } = await this.client._send("POST", "/v1/chat/completions", {
         body,
         extraHeaders,
         timeoutMs: requestTimeout,
+        deadlineMs,
+        maxRetries: options.maxRetries,
         retryStatuses: SAFE_RETRY_STATUSES,
         signal,
         stream: true,
@@ -219,10 +241,12 @@ export class ChatCompletions {
     }
     return this.client._request<ChatCompletion>("POST", "/v1/chat/completions", {
       body,
-      extraHeaders: { "Idempotency-Key": generateIdempotencyKey(idempotencyKey) },
+      extraHeaders: { ...options.headers, "Idempotency-Key": resolveIdempotencyKey(idempotencyKey, options.headers) },
       timeoutMs: requestTimeout,
-      retryStatuses: SAFE_RETRY_STATUSES,
-      retrySentErrors: false,
+      deadlineMs,
+      retryWindowMs: CHAT_RETRY_WINDOW_MS,
+      maxRetries: options.maxRetries,
+      retryStatuses: CHAT_RETRY_STATUSES,
       signal,
     });
   }
@@ -240,8 +264,12 @@ export class V1Models {
   constructor(private readonly client: NexusClient) {}
 
   /** GET /v1/models — модели, доступные ключу, в формате OpenAI. Нужен ключ. */
-  async list(): Promise<OpenAIModel[]> {
-    const data = await this.client._request<{ data?: OpenAIModel[] } | undefined>("GET", "/v1/models");
+  async list(options: RequestOptions = {}): Promise<OpenAIModel[]> {
+    const data = await this.client._request<{ data?: OpenAIModel[] } | undefined>(
+      "GET",
+      "/v1/models",
+      requestTransport(options),
+    );
     return data?.data ?? [];
   }
 }
@@ -253,15 +281,16 @@ export class V1Images {
    * POST /v1/images/generations — синхронно: сервер ждёт готовую картинку
    * (до 180 с, Seedream Pro до 540 с) и возвращает `{ created, data: [{ url }] }`.
    */
-  async generate(params: V1ImageGenerateParams): Promise<ImagesResponse> {
+  async generate(params: V1ImageGenerateParams, options: RequestOptions = {}): Promise<ImagesResponse> {
     const { idempotencyKey, timeoutMs, signal, ...rest } = params;
     return this.client._request<ImagesResponse>("POST", "/v1/images/generations", {
       body: compact(rest),
-      extraHeaders: { "Idempotency-Key": generateIdempotencyKey(idempotencyKey) },
-      timeoutMs: this.client._longTimeoutMs(timeoutMs),
-      retryStatuses: SAFE_RETRY_STATUSES,
-      retrySentErrors: false,
-      signal,
+      extraHeaders: { ...options.headers, "Idempotency-Key": resolveIdempotencyKey(idempotencyKey, options.headers) },
+      timeoutMs: this.client._longTimeoutMs(options.timeoutMs ?? timeoutMs),
+      deadlineMs: deadlineFrom(options.timeoutMs ?? timeoutMs),
+      retryStatuses: IMAGES_RETRY_STATUSES,
+      maxRetries: options.maxRetries,
+      signal: options.signal ?? signal,
     });
   }
 }
@@ -276,24 +305,26 @@ export class V1Videos {
   constructor(private readonly client: NexusClient) {}
 
   /** POST /v1/videos — создаёт видео (Sora-style), сразу возвращает объект со status "queued". */
-  async create(params: V1VideoCreateParams): Promise<VideoObject> {
-    const { idempotencyKey, signal, ...rest } = params;
+  async create(params: V1VideoCreateParams, options: RequestOptions = {}): Promise<VideoObject> {
+    const { idempotencyKey, signal, timeoutMs, ...rest } = params as V1VideoCreateParams & { timeoutMs?: number };
+    const explicitTimeout = options.timeoutMs ?? timeoutMs;
     return this.client._request<VideoObject>("POST", "/v1/videos", {
       body: compact(rest),
-      extraHeaders: { "Idempotency-Key": generateIdempotencyKey(idempotencyKey) },
-      timeoutMs: this.client._generateTimeoutMs(),
-      signal,
+      extraHeaders: { ...options.headers, "Idempotency-Key": resolveIdempotencyKey(idempotencyKey, options.headers) },
+      timeoutMs: explicitTimeout ?? this.client._generateTimeoutMs(),
+      deadlineMs: deadlineFrom(explicitTimeout),
+      maxRetries: options.maxRetries,
+      signal: options.signal ?? signal,
     });
   }
 
   /** GET /v1/videos/{id}. У готового видео ссылка в поле `url`. */
-  async retrieve(
-    video: string | Pick<VideoObject, "id">,
-    options: { signal?: AbortSignal } = {},
-  ): Promise<VideoObject> {
-    return this.client._request<VideoObject>("GET", `/v1/videos/${encodeURIComponent(videoId(video))}`, {
-      signal: options.signal,
-    });
+  async retrieve(video: string | Pick<VideoObject, "id">, options: RequestOptions = {}): Promise<VideoObject> {
+    return this.client._request<VideoObject>(
+      "GET",
+      `/v1/videos/${encodeURIComponent(videoId(video))}`,
+      requestTransport(options),
+    );
   }
 
   /**

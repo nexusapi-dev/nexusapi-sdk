@@ -11,7 +11,13 @@ Nano-Banana и др.) и текстовых моделей (Claude, GPT) чер�
 npm install nexusapi-sdk
 ```
 
-Требует **Node.js 18+** (используем встроенный `fetch`). Без внешних зависимостей.
+Требует **Node.js 20+** (используем встроенные `fetch` и WebCrypto). Без внешних
+зависимостей. Работает и через `import`, и через `require` (сборки ESM и
+CommonJS), а также в Deno, Bun и edge-средах.
+
+Ключ API создаётся в [panel.nexusapi.dev](https://panel.nexusapi.dev). Удобнее
+всего положить его в переменную окружения `NEXUSAPI_API_KEY` — тогда в коде
+его не будет.
 
 > Пакет на npm называется `nexusapi-sdk` (имя `nexusapi` зарезервировано
 > другим проектом). Mirror Python SDK: `pip install nexusapi-sdk`.
@@ -21,9 +27,7 @@ npm install nexusapi-sdk
 ```ts
 import { NexusClient } from "nexusapi-sdk";
 
-const client = new NexusClient({
-  apiKey: process.env.NEXUS_KEY!,  // создать в panel.nexusapi.dev
-});
+const client = new NexusClient(); // ключ из NEXUSAPI_API_KEY (или { apiKey: "..." })
 
 // Изображение (sync — SDK сам опрашивает статус)
 const img = await client.images.generate({
@@ -124,6 +128,82 @@ console.log(video.url);
 
 `client.v1.chat` — тот же объект, что и `client.chat`.
 
+## Настройки клиента
+
+```ts
+const client = new NexusClient({
+  apiKey: "...",                        // по умолчанию NEXUSAPI_API_KEY
+  baseUrl: "https://nexusapi.dev",      // по умолчанию NEXUSAPI_BASE_URL
+  timeoutMs: 60_000,
+  maxRetries: 2,                        // повторы при 429/5xx/сетевых ошибках
+  defaultHeaders: { "X-Team": "media" },
+  fetch: customFetch,                   // прокси, undici Agent, тесты
+});
+
+// Разовые настройки — копия клиента
+await client.withOptions({ maxRetries: 0, defaultHeaders: { "X-Trace": "abc" } }).tasks.get(taskId);
+
+// Или опции одного вызова — второй аргумент методов ресурсов
+// (для task.wait / v1.videos.wait — { timeoutMs, pollIntervalMs, signal })
+await client.videos.create(
+  { model: "veo-3-fast", prompt: "…", duration: 8 },
+  { signal: controller.signal, timeoutMs: 120_000, maxRetries: 1, headers: { "X-Trace": "abc" } },
+);
+```
+
+`timeoutMs` клиента — лимит одной попытки (вместе с чтением ответа); у
+`POST /generate` он не меньше 120 с, у чата и `v1.images` — не меньше 600 с.
+`timeoutMs` вызова — общий лимит на весь вызов вместе с повторами. Без него
+`v1.images.generate` при повторах 504 может ждать дольше 180 с (до ~9 минут);
+ограничьте его `timeoutMs` или `maxRetries`.
+
+Свой ключ идемпотентности можно передать в параметрах (`idempotencyKey`) или
+заголовком `Idempotency-Key` вызова — SDK использует его во всех повторах.
+
+> **ESM и CommonJS.** Пакет содержит обе сборки. Если в одном процессе его
+> загрузили и через `import`, и через `require`, это две копии классов:
+> `instanceof` ошибки одной копии против класса другой вернёт `false`. Держитесь
+> одного способа импорта или проверяйте `err.name`.
+
+## Вебхуки и проверка подписи
+
+Передайте `webhook_url` при создании задачи — когда она завершится, NexusAPI
+пришлёт POST с телом `{ task_id, status, result, error }` и подписью в
+заголовках `X-Nexus-Timestamp` / `X-Nexus-Signature`. Проверяйте подпись по
+**сырому** телу запроса:
+
+```ts
+import express from "express";
+import { NexusClient, WebhookVerificationError } from "nexusapi-sdk";
+
+const client = new NexusClient();
+const app = express();
+
+app.post("/nexus-callback", express.raw({ type: "application/json" }), async (req, res) => {
+  try {
+    const event = await client.webhooks.unwrap(req.body, req.headers);
+    if (event.status === "completed") await saveResult(event.task_id, event.result);
+    res.sendStatus(200);
+  } catch (e) {
+    if (e instanceof WebhookVerificationError) return res.sendStatus(400);
+    throw e;
+  }
+});
+```
+
+`client.webhooks.unwrap` вычисляет секрет из ключа клиента. Если сервис,
+принимающий вебхуки, не должен знать API-ключ, получите секрет один раз
+(`await client.webhooks.secret()` → `whsec_…`) и проверяйте им:
+
+```ts
+import { unwrapWebhook } from "nexusapi-sdk";
+
+const event = await unwrapWebhook(rawBody, request.headers, process.env.NEXUS_WEBHOOK_SECRET!);
+```
+
+Подпись старше 5 минут отклоняется (`toleranceSeconds` меняет допуск) — так
+перехваченный запрос нельзя прислать повторно.
+
 ## Возможности
 
 - **Auto-retries** — на 5xx, 429 и сетевые ошибки. По умолчанию до 3 попыток
@@ -131,23 +211,24 @@ console.log(video.url);
   (секунды, HTTP-дата, `retry-after-ms`; больше 60 с не ждёт). Настраивается
   через `maxRetries: N` в опциях клиента. Паузу между повторами прерывает `signal`.
 - **Auto Idempotency-Key** — для каждого POST автоматически генерируется
-  UUID v4, если не передан свой (8–256 печатных ASCII-символов). Повтор самого
-  SDK с тем же ключом не создаёт вторую задачу; если повтор получил 409
-  «первый запрос ещё выполняется», SDK ждёт до 2 минут его сохранённый ответ.
-  Для стрима чата ключ уходит только если передан явно, а повтор делается
-  только когда запрос не дошёл до сервера.
-- **Что делать после ошибки.** У каждой ошибки есть `idempotencyKey`.
-  - `NetworkError`, `ConflictError`, 4xx: повторяйте с тем же ключом, а не с
-    новым — если первый запрос выполнился, сервер вернёт его результат.
-  - 5xx: сервер ответ не сохраняет, запрос мог быть оплачен. Проверьте
-    результат (`client.tasks.get`) прежде чем повторять.
-  - Стрим чата повторить нельзя: сервер не сохраняет его результат.
-- **Таймауты** — `timeoutMs` покрывает весь запрос вместе с чтением ответа.
-  `POST /generate` ждёт не меньше 120 с (часть моделей до ответа проверяет
-  входные файлы), `chat.completions` и `v1.images.generate` — не меньше 600 с
-  (поле `timeoutMs`). Ответы 500, 502 и 504 долгих запросов и обрыв уже
-  отправленного запроса SDK не повторяет: задача могла уже начаться, и
-  повтор оплатил бы её второй раз.
+  UUID v4, если не передан свой (8–256 печатных ASCII-символов). Генерации
+  (`/generate`, `/v1/images`, `/v1/videos`) сервер привязывает к ключу: повтор
+  с тем же ключом — после 5xx, таймаута или обрыва — возвращает ту же задачу и
+  не списывает деньги второй раз. Если повтор получил 409 «первый запрос ещё
+  выполняется», SDK ждёт до 2 минут его ответ.
+- **Что делать после ошибки.** У ошибок POST-запросов есть `idempotencyKey`,
+  у ошибок с ответом сервера — `requestId`.
+  - Генерации: повторяйте с тем же `idempotencyKey`, а не с новым — сервер
+    вернёт ту же задачу. 504 у `v1.images.generate` несёт `taskId`: задачу можно
+    дождаться через `(await client.tasks.get(err.taskId)).wait()`.
+  - Чат: сервер хранит только успешный ответ — после 5xx повтор вызовет
+    модель снова. Поэтому 500 и 503 SDK у чата сам не повторяет, а остальные
+    повторы делает только в первые 9 минут вызова, пока сервер держит замок
+    ключа.
+  - Стрим чата повторить нельзя: сервер его не сохраняет.
+  - В поддержку пишите с `requestId` — по нему находят запрос в логах.
+- **Таймауты** — см. «Настройки клиента»: таймаут клиента — на попытку,
+  `timeoutMs` вызова — на весь вызов. Таймаут — `APITimeoutError`.
 - **Ожидание задач** — `task.wait()` и `client.v1.videos.wait()` пережидают
   временные ошибки опроса (сеть, 429, 5xx) и принимают
   `{ timeoutMs, pollIntervalMs, signal }`. Если время вышло, задача продолжает
@@ -156,24 +237,29 @@ console.log(video.url);
 - **Ключ не утекает в логи** — `console.log(client)` и `JSON.stringify(task)`
   не показывают API-ключ.
 - **Лимит fetch в Node** — встроенный `fetch` ждёт заголовки ответа не дольше
-  300 с. Для генераций, которые могут идти дольше (например, Seedream Pro),
-  используйте нативный `client.images.generate` (опрос задачи) или стрим
-  чата; либо передайте свой `fetch` с undici `Agent({ headersTimeout: 0 })`.
+  300 с (`APITimeoutError`). Для генераций, которые могут идти дольше
+  (например, Seedream Pro), используйте нативный `client.images.generate`
+  (опрос задачи) или стрим чата; либо передайте свой `fetch` с undici
+  `Agent({ headersTimeout: 0 })`.
 - **Все native-параметры** — `webhook_url`, `negative_prompt`, `image_url`,
   `cfg_scale`, `video_urls` для seedance, `source_video_url` для veo-extend
   передаются прямо в `create()` / `generate()` как обычные поля объекта.
 - **Auto-polling** для image-моделей (sync UX). Для видео — `task.wait()`.
-- **Типизированные ошибки** — `NexusError` (база), `BillingError`,
-  `RateLimitError`, `ValidationError`, `NotFoundError`, `AuthenticationError`,
-  `PermissionError`, `TaskTimeoutError` (client-side wait), `TaskFailedError`
-  (провайдер не справился), `NetworkError` (retries исчерпаны),
-  `ConflictError` (409: запрос с этим Idempotency-Key ещё выполняется),
-  `StreamError` (ошибка внутри SSE-стрима), `APIResponseValidationError`
-  (ответ не JSON или без нужного поля). У ошибок есть `status`, `headers`,
-  `responseBody`, `idempotencyKey`, у сетевых — `cause`, у ошибок ожидания —
-  `taskId`.
-- **TypeScript-first** — полные типы для всех методов.
-- **Zero dependencies** — только native `fetch` Node 18+.
+- **Типизированные ошибки** — все наследуют `NexusError`:
+  - `APIStatusError` — любой HTTP-ответ с ошибкой; подклассы
+    `ValidationError` (400/422), `AuthenticationError` (401), `BillingError`
+    (402), `PermissionError` (403), `NotFoundError` (404), `ConflictError`
+    (409), `RateLimitError` (429), `InternalServerError` (5xx);
+  - `NetworkError` (ответа нет, причина в `.cause`) и его подкласс
+    `APITimeoutError`;
+  - `APIResponseValidationError`, `StreamError`, `TaskTimeoutError`,
+    `TaskFailedError`, `WebhookVerificationError`.
+
+  Поля: `status`, `headers`, `responseBody`, `requestId`, `code`, `type`,
+  `param`, `idempotencyKey`, у ошибок про задачу — `taskId`.
+- **TypeScript-first** — полные типы для всех методов; проверено
+  arethetypeswrong для `import` и `require`.
+- **Zero dependencies** — только встроенные `fetch` и WebCrypto.
 
 ## Примеры
 
@@ -186,19 +272,11 @@ const task = await client.videos.create({
   duration: 8,
   webhook_url: "https://your-app.com/nexus-callback",
 });
-// Не вызываем .wait() — NexusAPI POST'нет на webhook_url когда видео готово
+// Не вызываем .wait() — NexusAPI пришлёт подписанный POST, когда видео готово
 return task.id;  // сохраняем в БД, ждём колбэка
 ```
 
-Вебхук не подписан: POST на ваш адрес может прислать кто угодно. Считайте его
-только сигналом и берите результат из API:
-
-```ts
-async function onNexusCallback(payload: { task_id: string }) {
-  const task = await client.tasks.get(payload.task_id); // источник правды — API
-  if (task.status === "completed") await saveResult(task.id, task.videoUrl);
-}
-```
+Как проверить подпись вебхука — в разделе «Вебхуки и проверка подписи».
 
 ### Image-to-video (Kling motion)
 
@@ -239,8 +317,9 @@ console.log(task.result);         // сырой объект с провайде
 
 ```ts
 import {
-  NexusClient,
+  APIStatusError,
   BillingError,
+  NetworkError,
   RateLimitError,
   ValidationError,
 } from "nexusapi-sdk";
@@ -255,6 +334,11 @@ try {
     console.error("Превышен rate-limit");
   } else if (e instanceof ValidationError) {
     console.error("Невалидные параметры:", e.message);
+  } else if (e instanceof APIStatusError) {
+    console.error(`Ошибка API ${e.status}, requestId=${e.requestId}`);
+  } else if (e instanceof NetworkError) {
+    // повторять — с тем же ключом: сервер вернёт ту же задачу
+    console.error(`Нет ответа; повторите с idempotencyKey=${e.idempotencyKey}`);
   } else {
     throw e;
   }

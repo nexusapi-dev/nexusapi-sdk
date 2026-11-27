@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nexusapi-sdk"
-version = "0.3.1"
+version = "0.4.0"
 description = "Python SDK для NexusAPI — видео, изображения и текстовые модели через единый API (Veo, Kling, Seedance, Nano-Banana, Claude, GPT). OpenAI-совместимый /v1 со стримингом, sync + async, auto-retries, auto idempotency."
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "NexusAPI", email = "support@nexusapi.dev" }]
@@ -21,7 +21,6 @@ classifiers = [
     "Intended Audience :: Developers",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -38,6 +37,7 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest >= 7", "pytest-asyncio >= 0.21"]
+typing = ["mypy >= 1.10"]
 
 [project.urls]
 Homepage = "https://docs.nexusapi.dev/sdks/"

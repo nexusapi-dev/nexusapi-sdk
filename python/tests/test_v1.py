@@ -13,7 +13,9 @@ import pytest
 
 import nexusapi.client as cm
 from nexusapi import (
+    APITimeoutError,
     AsyncNexusClient,
+    InternalServerError,
     AsyncStream,
     ConflictError,
     NetworkError,
@@ -130,8 +132,9 @@ def test_chat_per_call_timeout_and_user_idempotency_key():
         model="m", messages=[], idempotency_key="my-key-123", timeout=30,
     )
     assert captured["idem"] == "my-key-123"
-    assert captured["timeout"]["read"] == 30
-    assert captured["timeout"]["connect"] == 30
+    # Явный timeout — общий лимит вызова: попытка получает остаток (≤ 30 с).
+    assert 29 < captured["timeout"]["read"] <= 30
+    assert 29 < captured["timeout"]["connect"] <= 30
 
 
 def test_chat_client_timeout_above_default_is_kept():
@@ -158,18 +161,24 @@ def test_chat_openai_error_shape():
     assert excinfo.value.response_body["error"]["type"] == "not_found_error"
 
 
-def test_chat_retries_503_but_not_500_or_504(no_sleep):
-    for status, expected_calls in ((503, 3), (500, 1), (504, 1), (502, 1)):
+def test_chat_retry_policy(no_sleep):
+    """Чат: 502/504 повторяем (прокси, сервер ещё работает). 500 — нет: он мог
+    прийти после вызова модели. 503 — нет: повтор снова отправил бы запрос
+    платному поставщику модели."""
+    for status, expected_calls in ((502, 3), (504, 3), (503, 1), (500, 1)):
         calls = {"n": 0}
+        keys: set[str] = set()
 
         def handler(request: httpx.Request, status=status) -> httpx.Response:
             calls["n"] += 1
+            keys.add(request.headers["idempotency-key"])
             return httpx.Response(status, json={"error": {"message": "x"}})
 
         with pytest.raises(NexusError) as excinfo:
             _client(handler, max_retries=2).chat.completions.create(model="m", messages=[])
         assert excinfo.value.status_code == status
         assert calls["n"] == expected_calls, status
+        assert len(keys) == 1
 
 
 def test_chat_retry_reuses_idempotency_key(no_sleep):
@@ -378,20 +387,34 @@ def test_v1_images_generate():
     assert captured["timeout"]["read"] == 600.0
 
 
-def test_v1_images_does_not_retry_504(no_sleep):
-    """504 у /v1/images/generations — задача ещё идёт; повтор оплатил бы её дважды."""
-    calls = {"n": 0}
+def test_v1_images_504_retries_with_same_key_and_exposes_task_id(no_sleep):
+    """504 у /v1/images: задача идёт и привязана к ключу — повтор с тем же
+    ключом продолжает ждать её; если ждать уже нельзя, в ошибке task_id."""
+    keys: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        calls["n"] += 1
-        return httpx.Response(504, json={"error": {
-            "message": "Task did not complete within 180s", "type": "timeout_error",
+        keys.append(request.headers["idempotency-key"])
+        return httpx.Response(504, headers={"x-request-id": "req_abc"}, json={"error": {
+            "message": "Task t-9 did not complete within 180s", "type": "timeout_error",
+            "task_id": "t-9",
         }})
 
-    with pytest.raises(NexusError) as excinfo:
-        _client(handler, max_retries=3).v1.images.generate(model="m", prompt="p")
-    assert excinfo.value.status_code == 504
-    assert calls["n"] == 1
+    with pytest.raises(InternalServerError) as excinfo:
+        _client(handler, max_retries=2).v1.images.generate(model="m", prompt="p")
+    err = excinfo.value
+    assert err.status_code == 504 and err.task_id == "t-9"
+    assert err.type == "timeout_error" and err.request_id == "req_abc"
+    assert len(keys) == 3 and len(set(keys)) == 1
+
+    calls = {"n": 0}
+
+    def eventually(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(504, json={"error": {"message": "wait", "task_id": "t-9"}})
+        return httpx.Response(200, json={"created": 1, "data": [{"url": "u"}]})
+
+    assert _client(eventually).v1.images.generate(model="m", prompt="p")["data"][0]["url"] == "u"
 
 
 def test_v1_videos_create_retrieve_wait():
@@ -541,8 +564,13 @@ async def test_async_v1_resources(no_sleep):
 # ============================================================
 
 
-@pytest.mark.parametrize("exc", [httpx.ReadError("reset"), httpx.ReadTimeout("slow")])
-def test_long_request_not_retried_after_send(no_sleep, exc):
+@pytest.mark.parametrize("exc,err_cls", [
+    (httpx.ReadError("reset"), NetworkError),
+    (httpx.ReadTimeout("slow"), APITimeoutError),
+])
+def test_long_request_retried_after_send_with_same_key(no_sleep, exc, err_cls):
+    """Обрыв после отправки: сервер хранит результат по ключу (генерации — ту же
+    задачу), поэтому SDK повторяет с тем же ключом."""
     calls: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -554,9 +582,9 @@ def test_long_request_not_retried_after_send(no_sleep, exc):
         lambda c: c.v1.images.generate(model="m", prompt="p"),
     ):
         calls.clear()
-        with pytest.raises(NetworkError) as excinfo:
-            call(_client(handler, max_retries=3))
-        assert len(calls) == 1
+        with pytest.raises(err_cls) as excinfo:
+            call(_client(handler, max_retries=2))
+        assert len(calls) == 3 and len(set(calls)) == 1
         assert excinfo.value.idempotency_key == calls[0]
         assert calls[0] in str(excinfo.value)
 
@@ -606,15 +634,18 @@ def test_protocol_error_wrapped_as_network_error():
 
 
 @pytest.mark.asyncio
-async def test_async_long_request_not_retried_after_send(no_sleep):
+async def test_async_long_request_retried_after_send(no_sleep):
     calls = {"n": 0}
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls["n"] += 1
-        raise httpx.ReadError("reset")
+        if calls["n"] == 1:
+            raise httpx.ReadError("reset")
+        return httpx.Response(200, json={"created": 1, "data": [{"url": "u"}]})
 
     async with _aclient(handler, max_retries=3) as client:
-        with pytest.raises(NetworkError) as excinfo:
-            await client.v1.images.generate(model="m", prompt="p")
-    assert calls["n"] == 1
-    assert excinfo.value.idempotency_key.startswith("sdk-")
+        resp = await client.v1.images.generate(model="m", prompt="p")
+    assert resp["data"][0]["url"] == "u"
+    assert calls["n"] == 2
+
+

@@ -47,10 +47,13 @@ Async пример:
 from __future__ import annotations
 
 import asyncio
+import copy
 import email.utils
 import json as _json
 import logging
 import math
+import os
+import platform
 import random
 import re
 import time
@@ -66,6 +69,7 @@ from typing import (
     Optional,
     Type,
     Union,
+    cast,
     overload,
 )
 from urllib.parse import quote, urlsplit
@@ -73,8 +77,21 @@ from urllib.parse import quote, urlsplit
 import httpx
 
 from . import errors
+from . import webhooks as _webhooks
+from .types import (
+    ChatCompletion,
+    ChatCompletionChunk,
+    ImagesResponse,
+    ModelInfo,
+    OpenAIModel,
+    Video,
+    WebhookEvent,
+)
 
 DEFAULT_BASE_URL = "https://nexusapi.dev"
+#: Переменные окружения, из которых клиент берёт ключ и адрес API.
+ENV_API_KEY = "NEXUSAPI_API_KEY"
+ENV_BASE_URL = "NEXUSAPI_BASE_URL"
 DEFAULT_TIMEOUT = 60.0
 DEFAULT_MAX_RETRIES = 2
 
@@ -108,10 +125,30 @@ logger = logging.getLogger("nexusapi")
 # 5xx — серверная нестабильность которая может пройти сама.
 _RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
 
-# Для долгих синхронных /v1-запросов 500/502/504 НЕ повторяем: сервер мог уже
-# создать платную задачу (например, 504 у /v1/images/generations значит
-# «задача ещё идёт»), а 5xx не кэшируется по Idempotency-Key — повтор создал
-# бы вторую задачу и второе списание. 429 и 503 приходят до создания задачи.
+# Генерации (/generate, /v1/images, /v1/videos) сервер привязывает к
+# Idempotency-Key: повтор после 5xx или обрыва возвращает ту же задачу, а у
+# /v1/images 504 повтор продолжает ждать её. Поэтому их повторяем как обычно.
+#
+# Чат к задаче не привязан: сервер хранит только успешный ответ, а 500 мог
+# прийти после вызова модели — его не повторяем. 502/504 приходят от прокси,
+# пока сервер ещё работает: повтор с тем же ключом получит 409 (SDK подождёт)
+# или сохранённый ответ.
+_CHAT_RETRY_STATUSES = frozenset({429, 502, 504})
+# 503 у чата сервер отдаёт и после неудачного вызова поставщика модели (в т.ч.
+# по таймауту): ответ не сохраняется, и повтор снова платно отправил бы запрос
+# поставщику. Поэтому 503 у чата не повторяем.
+#
+# Замок Idempotency-Key на сервере живёт 600 с: после этого повтор чата мог бы
+# запустить модель второй раз, пока первый запрос ещё идёт. Повторы и ожидание
+# 409 для чата — только в первые 540 с вызова.
+_CHAT_RETRY_WINDOW = 540.0
+
+# У /v1/images 500 означает, что задача завершилась ошибкой: повтор с тем же
+# ключом вернёт ту же упавшую задачу. Остальные 5xx повторяем.
+_IMAGES_RETRY_STATUSES = frozenset({429, 502, 503, 504})
+
+# SSE-стрим сервер не сохраняет вовсе: повторяем только ответы, пришедшие до
+# начала генерации.
 _SAFE_RETRY_STATUSES = frozenset({429, 503})
 
 # Ошибки, при которых запрос гарантированно не ушёл на сервер. Только их
@@ -134,7 +171,20 @@ def _get_version() -> str:
 
 
 VERSION = _get_version()
-_USER_AGENT = f"nexusapi-python/{VERSION}"
+_USER_AGENT = f"nexusapi-python/{VERSION} python/{platform.python_version()}"
+
+
+class NotGiven:
+    """Значение «не передано» для with_options() (в отличие от None)."""
+
+    def __bool__(self) -> bool:
+        return False
+
+    def __repr__(self) -> str:
+        return "NOT_GIVEN"
+
+
+NOT_GIVEN = NotGiven()
 
 
 def _backoff_delay(attempt: int) -> float:
@@ -142,7 +192,7 @@ def _backoff_delay(attempt: int) -> float:
 
     0 → 0.5..0.625s, 1 → 1..1.25s, 2 → 2..2.5s, 3+ → 4..5s (jitter до +25%).
     """
-    base = min(4.0, 0.5 * (2 ** attempt))
+    base: float = min(4.0, 0.5 * (2 ** attempt))
     return base * random.uniform(1.0, 1.25)
 
 
@@ -180,7 +230,7 @@ def _error_message(body: Any, text: str, status_code: int) -> str:
     return _truncate(str(message)) if message else f"HTTP {status_code}"
 
 
-def _parse_error(resp: httpx.Response) -> tuple[str, Type[errors.NexusError], Any]:
+def _parse_error(resp: httpx.Response) -> tuple[str, Type[errors.APIStatusError], Any]:
     """Парсит response → (message, exception_class, response_body).
 
     Используется в обоих sync/async вариантах _raise_for_status — extract
@@ -199,7 +249,7 @@ def _parse_error(resp: httpx.Response) -> tuple[str, Type[errors.NexusError], An
         body = _truncate(text, 2000) if text else None
     message = _error_message(body, text, resp.status_code)
 
-    cls_map: dict[int, Type[errors.NexusError]] = {
+    cls_map: dict[int, Type[errors.APIStatusError]] = {
         400: errors.ValidationError,
         401: errors.AuthenticationError,
         402: errors.BillingError,
@@ -209,7 +259,9 @@ def _parse_error(resp: httpx.Response) -> tuple[str, Type[errors.NexusError], An
         422: errors.ValidationError,
         429: errors.RateLimitError,
     }
-    cls = cls_map.get(resp.status_code, errors.NexusError)
+    cls = cls_map.get(resp.status_code)
+    if cls is None:
+        cls = errors.InternalServerError if resp.status_code >= 500 else errors.APIStatusError
     return message, cls, body
 
 
@@ -234,6 +286,71 @@ def _parse_retry_after(headers: Mapping[str, str]) -> Optional[float]:
     if value is None or not math.isfinite(value) or value < 0 or value > _MAX_RETRY_AFTER:
         return None
     return value
+
+
+class _RetryBudget:
+    """Когда ещё можно повторить: число попыток, общий дедлайн вызова (явный
+    timeout метода) и окно повторов (чат)."""
+
+    def __init__(
+        self, max_retries: int, deadline: Optional[float], retry_window: Optional[float],
+    ) -> None:
+        self.max_retries = max_retries
+        self.deadline = deadline
+        self.window_end = time.monotonic() + retry_window if retry_window is not None else None
+        self.attempt = 0
+        self.conflict_attempt = 0
+        self.conflict_deadline: Optional[float] = None
+
+    def allows(self, delay: float) -> bool:
+        now = time.monotonic()
+        if self.window_end is not None and now >= self.window_end:
+            return False
+        if self.deadline is not None and now + delay >= self.deadline:
+            return False
+        return True
+
+    def can_retry(self, delay: float) -> bool:
+        return self.attempt < self.max_retries and self.allows(delay)
+
+    def attempt_timeout(self, timeout: Any) -> Any:
+        """Таймаут попытки, урезанный до остатка общего дедлайна."""
+        if self.deadline is None:
+            return timeout
+        remaining = max(0.001, self.deadline - time.monotonic())
+        if isinstance(timeout, httpx.Timeout):
+            return httpx.Timeout(
+                connect=_min_opt(timeout.connect, remaining),
+                read=_min_opt(timeout.read, remaining),
+                write=_min_opt(timeout.write, remaining),
+                pool=_min_opt(timeout.pool, remaining),
+            )
+        return remaining if timeout is None else min(float(timeout), remaining)
+
+
+def _min_opt(value: Optional[float], cap: float) -> float:
+    return cap if value is None else min(value, cap)
+
+
+def _deadline(timeout: Optional[float]) -> Optional[float]:
+    return time.monotonic() + timeout if timeout is not None else None
+
+
+def _set_header(headers: dict[str, str], name: str, value: str) -> None:
+    """Ставит заголовок без учёта регистра: `authorization` и `Authorization` —
+    один заголовок, иначе httpx отправил бы оба."""
+    lower = name.lower()
+    for key in [k for k in headers if k.lower() == lower]:
+        del headers[key]
+    headers[name] = value
+
+
+def _get_header(headers: Mapping[str, str], name: str) -> Optional[str]:
+    lower = name.lower()
+    for key, value in headers.items():
+        if key.lower() == lower:
+            return value
+    return None
 
 
 def _retry_delay(resp: httpx.Response, attempt: int) -> float:
@@ -341,7 +458,7 @@ class Stream:
         self.response = response
         self._iterator = self._iter_events()
 
-    def _iter_events(self) -> Iterator[dict]:
+    def _iter_events(self) -> Iterator[ChatCompletionChunk]:
         decoder = _SSEDecoder()
         try:
             try:
@@ -357,14 +474,15 @@ class Stream:
                         return
                     yield event
             except httpx.TransportError as e:
-                raise errors.NetworkError(f"Stream interrupted: {e}") from e
+                cls = errors.APITimeoutError if isinstance(e, httpx.TimeoutException) else errors.NetworkError
+                raise cls(f"Stream interrupted: {e}") from e
         finally:
             self.response.close()
 
-    def __iter__(self) -> Iterator[dict]:
+    def __iter__(self) -> Iterator[ChatCompletionChunk]:
         return self._iterator
 
-    def __next__(self) -> dict:
+    def __next__(self) -> ChatCompletionChunk:
         return next(self._iterator)
 
     def close(self) -> None:
@@ -384,7 +502,7 @@ class AsyncStream:
         self.response = response
         self._iterator = self._iter_events()
 
-    async def _iter_events(self) -> AsyncIterator[dict]:
+    async def _iter_events(self) -> AsyncIterator[ChatCompletionChunk]:
         decoder = _SSEDecoder()
         try:
             try:
@@ -400,14 +518,15 @@ class AsyncStream:
                         return
                     yield event
             except httpx.TransportError as e:
-                raise errors.NetworkError(f"Stream interrupted: {e}") from e
+                cls = errors.APITimeoutError if isinstance(e, httpx.TimeoutException) else errors.NetworkError
+                raise cls(f"Stream interrupted: {e}") from e
         finally:
             await self.response.aclose()
 
-    def __aiter__(self) -> AsyncIterator[dict]:
+    def __aiter__(self) -> AsyncIterator[ChatCompletionChunk]:
         return self._iterator
 
-    async def __anext__(self) -> dict:
+    async def __anext__(self) -> ChatCompletionChunk:
         return await self._iterator.__anext__()
 
     async def close(self) -> None:
@@ -431,7 +550,7 @@ class _TaskBase:
     id: str
     status: str
     model: Optional[str] = None
-    result: Optional[dict] = None
+    result: Optional[Any] = None
     error: Optional[str] = None
     created_at: Optional[str] = None
 
@@ -439,12 +558,32 @@ class _TaskBase:
     def is_done(self) -> bool:
         return self.status in ("completed", "failed")
 
-    def _result_dict(self) -> dict:
+    def __copy__(self) -> Any:
+        clone = self.__class__.__new__(self.__class__)
+        clone.__dict__.update(self.__dict__)
+        return clone
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> Any:
+        clone = self.__class__.__new__(self.__class__)
+        memo[id(self)] = clone
+        for key, value in self.__dict__.items():
+            # Клиент (пул соединений) не копируем — копия задачи работает через тот же.
+            clone.__dict__[key] = value if key == "_client" else copy.deepcopy(value, memo)
+        return clone
+
+    def __getstate__(self) -> dict[str, Any]:
+        # Без клиента: в нём HTTP-пул и ключ API. После unpickle задачу можно
+        # прочитать, а для refresh()/wait() — получить заново через tasks.get().
+        state = self.__dict__.copy()
+        state["_client"] = None
+        return state
+
+    def _result_dict(self) -> dict[str, Any]:
         return self.result if isinstance(self.result, dict) else {}
 
     @property
     def video_url(self) -> Optional[str]:
-        return self._result_dict().get("video_url")
+        return _str_or_none(self._result_dict().get("video_url"))
 
     @property
     def image_url(self) -> Optional[str]:
@@ -452,11 +591,11 @@ class _TaskBase:
         r = self._result_dict()
         urls = r.get("image_urls")
         if isinstance(urls, list) and urls:
-            return urls[0]
-        return r.get("image_url")
+            return _str_or_none(urls[0])
+        return _str_or_none(r.get("image_url"))
 
     @property
-    def image_urls(self) -> list:
+    def image_urls(self) -> list[str]:
         urls = self._result_dict().get("image_urls")
         return list(urls) if isinstance(urls, list) else []
 
@@ -466,11 +605,11 @@ class _TaskBase:
         r = self._result_dict()
         urls = r.get("audio_urls")
         if isinstance(urls, list) and urls:
-            return urls[0]
-        return r.get("audio_url")
+            return _str_or_none(urls[0])
+        return _str_or_none(r.get("audio_url"))
 
     @property
-    def audio_urls(self) -> list:
+    def audio_urls(self) -> list[str]:
         urls = self._result_dict().get("audio_urls")
         return list(urls) if isinstance(urls, list) else []
 
@@ -491,6 +630,10 @@ class _TaskBase:
         )
         err.task_id, err.task = self.id, self
         return err
+
+
+def _str_or_none(value: Any) -> Optional[str]:
+    return value if isinstance(value, str) else None
 
 
 def _is_transient(e: errors.NexusError) -> bool:
@@ -681,18 +824,18 @@ def _build_body(required: dict[str, Any], optional: dict[str, Any]) -> dict[str,
     return body
 
 
-def _video_id(video: Union[str, dict]) -> str:
+def _video_id(video: Union[str, Mapping[str, Any]]) -> str:
     video_id = video.get("id") if isinstance(video, dict) else video
     if not video_id:
         raise ValueError("video id is required")
     return str(video_id)
 
 
-def _video_path(video: Union[str, dict]) -> str:
+def _video_path(video: Union[str, Mapping[str, Any]]) -> str:
     return f"/v1/videos/{quote(_video_id(video), safe='')}"
 
 
-def _raise_if_video_failed(video: dict) -> None:
+def _raise_if_video_failed(video: Mapping[str, Any]) -> None:
     if video.get("status") != "failed":
         return
     err = video.get("error") or {}
@@ -705,7 +848,7 @@ def _raise_if_video_failed(video: dict) -> None:
     raise err
 
 
-def _video_timeout_error(current: dict, timeout: float) -> errors.TimeoutError:
+def _video_timeout_error(current: Mapping[str, Any], timeout: float) -> errors.TimeoutError:
     err = errors.TimeoutError(
         f"Video {current.get('id')} did not complete within {timeout}s "
         f"(last status: {current.get('status')}); it is still running — wait for it "
@@ -815,10 +958,11 @@ class Tasks(_Resource):
 
 
 class Models(_Resource):
-    def list(self) -> list[dict]:
+    def list(self) -> list[ModelInfo]:
         """Возвращает каталог моделей с ценами. Использует публичный
         /public/models (без ключа). Список в OpenAI-формате — client.v1.models.list()."""
-        return self._client._request("GET", "/public/models", auth=False)
+        data = self._client._request("GET", "/public/models", auth=False)
+        return list(data or [])
 
 
 class ChatCompletions(_Resource):
@@ -829,19 +973,19 @@ class ChatCompletions(_Resource):
         self,
         *,
         model: str,
-        messages: list[dict],
+        messages: list[dict[str, Any]],
         stream: Literal[False] = False,
         idempotency_key: Optional[str] = None,
         timeout: Optional[float] = None,
         **extras: Any,
-    ) -> dict: ...
+    ) -> ChatCompletion: ...
 
     @overload
     def create(
         self,
         *,
         model: str,
-        messages: list[dict],
+        messages: list[dict[str, Any]],
         stream: Literal[True],
         idempotency_key: Optional[str] = None,
         timeout: Optional[float] = None,
@@ -853,23 +997,23 @@ class ChatCompletions(_Resource):
         self,
         *,
         model: str,
-        messages: list[dict],
+        messages: list[dict[str, Any]],
         stream: bool,
         idempotency_key: Optional[str] = None,
         timeout: Optional[float] = None,
         **extras: Any,
-    ) -> Union[dict, Stream]: ...
+    ) -> Union[ChatCompletion, Stream]: ...
 
     def create(
         self,
         *,
         model: str,
-        messages: list[dict],
+        messages: list[dict[str, Any]],
         stream: bool = False,
         idempotency_key: Optional[str] = None,
         timeout: Optional[float] = None,
         **extras: Any,
-    ) -> Union[dict, Stream]:
+    ) -> Union[ChatCompletion, Stream]:
         """Ответ модели. Без stream — dict в формате OpenAI `chat.completion`
         (`reply["choices"][0]["message"]["content"]`, `reply["usage"]`).
         С `stream=True` — Stream с чанками `chat.completion.chunk`.
@@ -890,6 +1034,7 @@ class ChatCompletions(_Resource):
         """
         body = _build_body({"model": model, "messages": messages}, extras)
         read_timeout = self._client._long_timeout(timeout)
+        deadline = _deadline(timeout)
         if stream:
             body["stream"] = True
             headers = {"Accept": "text/event-stream"}
@@ -899,14 +1044,15 @@ class ChatCompletions(_Resource):
             resp = self._client._send(
                 "POST", "/v1/chat/completions", json=body, extra_headers=headers,
                 timeout=read_timeout, retry_statuses=_SAFE_RETRY_STATUSES, stream=True,
+                deadline=deadline,
             )
             return Stream(resp)
         headers = {"Idempotency-Key": _generate_idempotency_key(idempotency_key)}
-        return self._client._request(
+        return cast(Union[ChatCompletion, Stream], self._client._request(
             "POST", "/v1/chat/completions", json=body, extra_headers=headers,
-            timeout=read_timeout, retry_statuses=_SAFE_RETRY_STATUSES,
-            retry_sent_errors=False,
-        )
+            timeout=read_timeout, retry_statuses=_CHAT_RETRY_STATUSES,
+            deadline=deadline, retry_window=_CHAT_RETRY_WINDOW,
+        ))
 
 
 class Chat:
@@ -915,7 +1061,7 @@ class Chat:
 
 
 class V1Models(_Resource):
-    def list(self) -> list[dict]:
+    def list(self) -> list[OpenAIModel]:
         """GET /v1/models — модели, доступные ключу, в формате OpenAI
         (`{"id", "object": "model", "created", "owned_by"}`). Нужен ключ."""
         data = self._client._request("GET", "/v1/models")
@@ -934,7 +1080,7 @@ class V1Images(_Resource):
         idempotency_key: Optional[str] = None,
         timeout: Optional[float] = None,
         **extras: Any,
-    ) -> dict:
+    ) -> ImagesResponse:
         """POST /v1/images/generations — синхронно: сервер ждёт готовую картинку
         (до 180 с, Seedream Pro до 540 с) и отдаёт
         `{"created": ..., "data": [{"url": ...}]}`.
@@ -949,12 +1095,11 @@ class V1Images(_Resource):
             {"size": size, "quality": quality, "seed": seed, **extras},
         )
         headers = {"Idempotency-Key": _generate_idempotency_key(idempotency_key)}
-        return self._client._request(
+        return cast(ImagesResponse, self._client._request(
             "POST", "/v1/images/generations", json=body, extra_headers=headers,
             timeout=self._client._long_timeout(timeout),
-            retry_statuses=_SAFE_RETRY_STATUSES,
-            retry_sent_errors=False,
-        )
+            retry_statuses=_IMAGES_RETRY_STATUSES, deadline=_deadline(timeout),
+        ))
 
 
 class V1Videos(_Resource):
@@ -965,11 +1110,11 @@ class V1Videos(_Resource):
         prompt: str,
         seconds: Optional[Union[int, str]] = None,
         size: Optional[str] = None,
-        input_reference: Optional[Union[str, list]] = None,
+        input_reference: Optional[Union[str, list[str]]] = None,
         seed: Optional[int] = None,
         idempotency_key: Optional[str] = None,
         **extras: Any,
-    ) -> dict:
+    ) -> Video:
         """POST /v1/videos — создаёт видео (Sora-style), сразу возвращает объект
         `{"id", "status": "queued", ...}`. Дождаться — client.v1.videos.wait(video).
 
@@ -986,23 +1131,23 @@ class V1Videos(_Resource):
              "seed": seed, **extras},
         )
         headers = {"Idempotency-Key": _generate_idempotency_key(idempotency_key)}
-        return self._client._request(
+        return cast(Video, self._client._request(
             "POST", "/v1/videos", json=body, extra_headers=headers,
             timeout=self._client._generate_timeout(),
-        )
+        ))
 
-    def retrieve(self, video: Union[str, dict]) -> dict:
+    def retrieve(self, video: Union[str, Mapping[str, Any]]) -> Video:
         """GET /v1/videos/{id}. Статус: queued / in_progress / completed / failed;
         у готового видео ссылка в поле `url`."""
-        return self._client._request("GET", _video_path(video))
+        return cast(Video, self._client._request("GET", _video_path(video)))
 
     def wait(
         self,
-        video: Union[str, dict],
+        video: Union[str, Mapping[str, Any]],
         *,
         timeout: float = DEFAULT_VIDEO_WAIT_TIMEOUT,
         poll_interval: float = DEFAULT_VIDEO_POLL_INTERVAL,
-    ) -> dict:
+    ) -> Video:
         """Опрашивает видео до completed. Принимает id или объект из create().
 
         Временные ошибки опроса (сеть, 429, 5xx) пережидает до дедлайна.
@@ -1014,7 +1159,7 @@ class V1Videos(_Resource):
         """
         video_id = _video_id(video)
         deadline = time.monotonic() + timeout
-        current: dict = {"id": video_id}
+        current: Video = {"id": video_id}
         while True:
             try:
                 current = self.retrieve(video_id)
@@ -1031,6 +1176,54 @@ class V1Videos(_Resource):
             if remaining <= 0:
                 raise _video_timeout_error(current, timeout)
             time.sleep(min(poll_interval, remaining))
+
+
+class Webhooks(_Resource):
+    """Подпись вебхуков: секрет и проверка входящих запросов.
+
+    Если сервис, принимающий вебхуки, знает API-ключ, проще всего
+    `client.webhooks.unwrap(body, headers)`: секрет вычисляется из ключа клиента.
+    Сервису без ключа — `nexusapi.webhooks.unwrap(body, headers, secret=...)`
+    с секретом из `client.webhooks.secret()`.
+    """
+
+    def secret(self) -> str:
+        """GET /webhooks/secret — секрет `whsec_…` для задач этого ключа."""
+        data = self._client._request("GET", "/webhooks/secret")
+        return _require_secret(data)
+
+    def unwrap(
+        self,
+        payload: _webhooks.Payload,
+        headers: Mapping[str, Any],
+        *,
+        secret: Optional[str] = None,
+        tolerance: float = _webhooks.DEFAULT_TOLERANCE,
+    ) -> WebhookEvent:
+        """Проверяет подпись вебхука и возвращает событие. `payload` — сырое тело
+        запроса. Без `secret` берётся секрет ключа этого клиента.
+
+        Raises:
+            WebhookVerificationError: подпись не прошла проверку.
+        """
+        return _webhooks.unwrap(
+            payload, headers, secret or _webhooks.secret_from_api_key(self._client._api_key),
+            tolerance=tolerance,
+        )
+
+    def verify_signature(
+        self,
+        payload: _webhooks.Payload,
+        headers: Mapping[str, Any],
+        *,
+        secret: Optional[str] = None,
+        tolerance: float = _webhooks.DEFAULT_TOLERANCE,
+    ) -> None:
+        """Только проверка подписи (без разбора тела). См. unwrap()."""
+        _webhooks.verify_signature(
+            payload, headers, secret or _webhooks.secret_from_api_key(self._client._api_key),
+            tolerance=tolerance,
+        )
 
 
 class V1:
@@ -1118,8 +1311,9 @@ class AsyncTasks(_AsyncResource):
 
 
 class AsyncModels(_AsyncResource):
-    async def list(self) -> list[dict]:
-        return await self._client._request("GET", "/public/models", auth=False)
+    async def list(self) -> list[ModelInfo]:
+        data = await self._client._request("GET", "/public/models", auth=False)
+        return list(data or [])
 
 
 class AsyncChatCompletions(_AsyncResource):
@@ -1130,19 +1324,19 @@ class AsyncChatCompletions(_AsyncResource):
         self,
         *,
         model: str,
-        messages: list[dict],
+        messages: list[dict[str, Any]],
         stream: Literal[False] = False,
         idempotency_key: Optional[str] = None,
         timeout: Optional[float] = None,
         **extras: Any,
-    ) -> dict: ...
+    ) -> ChatCompletion: ...
 
     @overload
     async def create(
         self,
         *,
         model: str,
-        messages: list[dict],
+        messages: list[dict[str, Any]],
         stream: Literal[True],
         idempotency_key: Optional[str] = None,
         timeout: Optional[float] = None,
@@ -1154,25 +1348,26 @@ class AsyncChatCompletions(_AsyncResource):
         self,
         *,
         model: str,
-        messages: list[dict],
+        messages: list[dict[str, Any]],
         stream: bool,
         idempotency_key: Optional[str] = None,
         timeout: Optional[float] = None,
         **extras: Any,
-    ) -> Union[dict, AsyncStream]: ...
+    ) -> Union[ChatCompletion, AsyncStream]: ...
 
     async def create(
         self,
         *,
         model: str,
-        messages: list[dict],
+        messages: list[dict[str, Any]],
         stream: bool = False,
         idempotency_key: Optional[str] = None,
         timeout: Optional[float] = None,
         **extras: Any,
-    ) -> Union[dict, AsyncStream]:
+    ) -> Union[ChatCompletion, AsyncStream]:
         body = _build_body({"model": model, "messages": messages}, extras)
         read_timeout = self._client._long_timeout(timeout)
+        deadline = _deadline(timeout)
         if stream:
             body["stream"] = True
             headers = {"Accept": "text/event-stream"}
@@ -1182,14 +1377,15 @@ class AsyncChatCompletions(_AsyncResource):
             resp = await self._client._send(
                 "POST", "/v1/chat/completions", json=body, extra_headers=headers,
                 timeout=read_timeout, retry_statuses=_SAFE_RETRY_STATUSES, stream=True,
+                deadline=deadline,
             )
             return AsyncStream(resp)
         headers = {"Idempotency-Key": _generate_idempotency_key(idempotency_key)}
-        return await self._client._request(
+        return cast(Union[ChatCompletion, AsyncStream], await self._client._request(
             "POST", "/v1/chat/completions", json=body, extra_headers=headers,
-            timeout=read_timeout, retry_statuses=_SAFE_RETRY_STATUSES,
-            retry_sent_errors=False,
-        )
+            timeout=read_timeout, retry_statuses=_CHAT_RETRY_STATUSES,
+            deadline=deadline, retry_window=_CHAT_RETRY_WINDOW,
+        ))
 
 
 class AsyncChat:
@@ -1198,7 +1394,7 @@ class AsyncChat:
 
 
 class AsyncV1Models(_AsyncResource):
-    async def list(self) -> list[dict]:
+    async def list(self) -> list[OpenAIModel]:
         data = await self._client._request("GET", "/v1/models")
         return list((data or {}).get("data") or [])
 
@@ -1215,18 +1411,17 @@ class AsyncV1Images(_AsyncResource):
         idempotency_key: Optional[str] = None,
         timeout: Optional[float] = None,
         **extras: Any,
-    ) -> dict:
+    ) -> ImagesResponse:
         body = _build_body(
             {"model": model, "prompt": prompt},
             {"size": size, "quality": quality, "seed": seed, **extras},
         )
         headers = {"Idempotency-Key": _generate_idempotency_key(idempotency_key)}
-        return await self._client._request(
+        return cast(ImagesResponse, await self._client._request(
             "POST", "/v1/images/generations", json=body, extra_headers=headers,
             timeout=self._client._long_timeout(timeout),
-            retry_statuses=_SAFE_RETRY_STATUSES,
-            retry_sent_errors=False,
-        )
+            retry_statuses=_IMAGES_RETRY_STATUSES, deadline=_deadline(timeout),
+        ))
 
 
 class AsyncV1Videos(_AsyncResource):
@@ -1237,36 +1432,36 @@ class AsyncV1Videos(_AsyncResource):
         prompt: str,
         seconds: Optional[Union[int, str]] = None,
         size: Optional[str] = None,
-        input_reference: Optional[Union[str, list]] = None,
+        input_reference: Optional[Union[str, list[str]]] = None,
         seed: Optional[int] = None,
         idempotency_key: Optional[str] = None,
         **extras: Any,
-    ) -> dict:
+    ) -> Video:
         body = _build_body(
             {"model": model, "prompt": prompt},
             {"seconds": seconds, "size": size, "input_reference": input_reference,
              "seed": seed, **extras},
         )
         headers = {"Idempotency-Key": _generate_idempotency_key(idempotency_key)}
-        return await self._client._request(
+        return cast(Video, await self._client._request(
             "POST", "/v1/videos", json=body, extra_headers=headers,
             timeout=self._client._generate_timeout(),
-        )
+        ))
 
-    async def retrieve(self, video: Union[str, dict]) -> dict:
-        return await self._client._request("GET", _video_path(video))
+    async def retrieve(self, video: Union[str, Mapping[str, Any]]) -> Video:
+        return cast(Video, await self._client._request("GET", _video_path(video)))
 
     async def wait(
         self,
-        video: Union[str, dict],
+        video: Union[str, Mapping[str, Any]],
         *,
         timeout: float = DEFAULT_VIDEO_WAIT_TIMEOUT,
         poll_interval: float = DEFAULT_VIDEO_POLL_INTERVAL,
-    ) -> dict:
+    ) -> Video:
         video_id = _video_id(video)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
-        current: dict = {"id": video_id}
+        current: Video = {"id": video_id}
         while True:
             try:
                 current = await self.retrieve(video_id)
@@ -1285,6 +1480,41 @@ class AsyncV1Videos(_AsyncResource):
             await asyncio.sleep(min(poll_interval, remaining))
 
 
+class AsyncWebhooks(_AsyncResource):
+    """Async-вариант Webhooks: secret() — корутина, проверка подписи синхронная
+    (это чистые вычисления без сети)."""
+
+    async def secret(self) -> str:
+        data = await self._client._request("GET", "/webhooks/secret")
+        return _require_secret(data)
+
+    def unwrap(
+        self,
+        payload: _webhooks.Payload,
+        headers: Mapping[str, Any],
+        *,
+        secret: Optional[str] = None,
+        tolerance: float = _webhooks.DEFAULT_TOLERANCE,
+    ) -> WebhookEvent:
+        return _webhooks.unwrap(
+            payload, headers, secret or _webhooks.secret_from_api_key(self._client._api_key),
+            tolerance=tolerance,
+        )
+
+    def verify_signature(
+        self,
+        payload: _webhooks.Payload,
+        headers: Mapping[str, Any],
+        *,
+        secret: Optional[str] = None,
+        tolerance: float = _webhooks.DEFAULT_TOLERANCE,
+    ) -> None:
+        _webhooks.verify_signature(
+            payload, headers, secret or _webhooks.secret_from_api_key(self._client._api_key),
+            tolerance=tolerance,
+        )
+
+
 class AsyncV1:
     def __init__(self, client: "AsyncNexusClient", chat: AsyncChat):
         self.chat = chat
@@ -1298,47 +1528,128 @@ class AsyncV1:
 # ============================================================
 
 
-class NexusClient:
+class _ClientBase:
+    """Общие настройки sync/async клиента."""
+
+    _api_key: str
+    _base_url: str
+    _timeout: Union[float, httpx.Timeout]
+    _max_retries: int
+    _default_headers: dict[str, str]
+
+    def _configure(
+        self,
+        api_key: Optional[str],
+        base_url: Optional[str],
+        timeout: Union[float, httpx.Timeout],
+        max_retries: int,
+        default_headers: Optional[Mapping[str, str]],
+    ) -> None:
+        if api_key is None:
+            api_key = os.environ.get(ENV_API_KEY) or None
+        if not api_key:
+            raise errors.AuthenticationError(
+                f"api_key is required: pass api_key=... or set the {ENV_API_KEY} environment variable"
+            )
+        if max_retries < 0:
+            raise ValueError("max_retries must be >= 0")
+        self._api_key = api_key
+        self._base_url = _normalize_base_url(
+            base_url or os.environ.get(ENV_BASE_URL) or DEFAULT_BASE_URL
+        )
+        self._timeout = timeout
+        self._max_retries = max_retries
+        self._default_headers = dict(default_headers or {})
+
+    def _merged_headers(
+        self, default_headers: Union[Mapping[str, str], NotGiven],
+    ) -> dict[str, str]:
+        merged = dict(self._default_headers)
+        if not isinstance(default_headers, NotGiven):
+            for name, value in default_headers.items():
+                _set_header(merged, name, value)
+        return merged
+
+    def _headers(self, auth: bool, extra_headers: Optional[Mapping[str, str]]) -> dict[str, str]:
+        # Порядок важен: заголовки пользователя не перебивают ключ API и
+        # Idempotency-Key запроса.
+        headers: dict[str, str] = {}
+        _set_header(headers, "User-Agent", _USER_AGENT)
+        for name, value in self._default_headers.items():
+            _set_header(headers, name, value)
+        if auth:
+            _set_header(headers, "Authorization", f"Bearer {self._api_key}")
+        for name, value in (extra_headers or {}).items():
+            _set_header(headers, name, value)
+        return headers
+
+    def __repr__(self) -> str:
+        # Без ключа: repr попадает в логи.
+        return f"{type(self).__name__}(base_url={self._base_url!r})"
+
+
+class NexusClient(_ClientBase):
     """Главный sync-клиент NexusAPI.
 
     Args:
-        api_key: Bearer-токен. Создаётся в panel.nexusapi.dev → API ключи.
-        base_url: URL API. Дефолт https://nexusapi.dev.
-        timeout: Таймаут HTTP-запросов в секундах. Дефолт 60. Для чата и
-            /v1/images/generations таймаут чтения не меньше 600 с.
-        max_retries: Сколько раз повторить при 5xx/429/network-ошибках.
-            Дефолт 2 (то есть до 3 попыток всего). 0 — отключить retries.
+        api_key: Bearer-токен (panel.nexusapi.dev → API ключи). Если не передан —
+            из переменной окружения NEXUSAPI_API_KEY.
+        base_url: URL API. По умолчанию NEXUSAPI_BASE_URL или https://nexusapi.dev.
+        timeout: Таймаут HTTP-запросов, с (или httpx.Timeout). Дефолт 60. Для
+            POST /generate чтение не меньше 120 с, для чата и
+            /v1/images/generations — не меньше 600 с.
+        max_retries: Сколько раз повторить при 5xx/429/сетевых ошибках.
+            Дефолт 2 (то есть до 3 попыток всего). 0 — отключить повторы.
+        default_headers: Заголовки для каждого запроса.
+        http_client: Свой httpx.Client (прокси, TLS, лимиты соединений). SDK
+            его не закрывает; таймаут и повторы берутся из настроек SDK.
+
+    Разовые настройки — через копию: `client.with_options(timeout=5).tasks.get(id)`.
     """
 
     def __init__(
         self,
-        api_key: str,
+        api_key: Optional[str] = None,
         *,
-        base_url: str = DEFAULT_BASE_URL,
-        timeout: float = DEFAULT_TIMEOUT,
+        base_url: Optional[str] = None,
+        timeout: Union[float, httpx.Timeout] = DEFAULT_TIMEOUT,
         max_retries: int = DEFAULT_MAX_RETRIES,
+        default_headers: Optional[Mapping[str, str]] = None,
+        http_client: Optional[httpx.Client] = None,
         # Для тестов: позволяем подменить transport (httpx.MockTransport).
         transport: Optional[httpx.BaseTransport] = None,
     ):
-        if not api_key:
-            raise errors.AuthenticationError("api_key is required")
-        if max_retries < 0:
-            raise ValueError("max_retries must be >= 0")
-        self._api_key = api_key
-        self._base_url = _normalize_base_url(base_url)
-        self._timeout = timeout
-        self._max_retries = max_retries
-        self._http = httpx.Client(
-            timeout=timeout,
-            headers={"User-Agent": _USER_AGENT},
-            transport=transport,
-        )
+        if http_client is not None and transport is not None:
+            raise ValueError("pass either http_client or transport, not both")
+        self._configure(api_key, base_url, timeout, max_retries, default_headers)
+        self._owns_http = http_client is None
+        self._http = http_client or httpx.Client(timeout=timeout, transport=transport)
         self.videos = Videos(self)
         self.images = Images(self)
         self.tasks = Tasks(self)
         self.models = Models(self)
         self.chat = Chat(self)
         self.v1 = V1(self, self.chat)
+        self.webhooks = Webhooks(self)
+
+    def with_options(
+        self,
+        *,
+        timeout: Union[float, httpx.Timeout, NotGiven] = NOT_GIVEN,
+        max_retries: Union[int, NotGiven] = NOT_GIVEN,
+        default_headers: Union[Mapping[str, str], NotGiven] = NOT_GIVEN,
+    ) -> "NexusClient":
+        """Копия клиента с другими настройками на том же пуле соединений:
+        `client.with_options(timeout=10, max_retries=0).videos.create(...)`.
+        Заголовки дополняют текущие. Закрывать копию не нужно."""
+        return NexusClient(
+            self._api_key,
+            base_url=self._base_url,
+            timeout=self._timeout if isinstance(timeout, NotGiven) else timeout,
+            max_retries=self._max_retries if isinstance(max_retries, NotGiven) else max_retries,
+            default_headers=self._merged_headers(default_headers),
+            http_client=self._http,
+        )
 
     def _long_timeout(self, timeout: Optional[float]) -> httpx.Timeout:
         return _long_timeout(self._timeout, timeout)
@@ -1351,14 +1662,16 @@ class NexusClient:
         method: str,
         path: str,
         *,
-        json: Optional[dict] = None,
-        params: Optional[dict] = None,
+        json: Optional[dict[str, Any]] = None,
+        params: Optional[dict[str, Any]] = None,
         auth: bool = True,
-        extra_headers: Optional[dict] = None,
+        extra_headers: Optional[Mapping[str, str]] = None,
         timeout: Any = None,
-        retry_statuses: frozenset = _RETRYABLE_STATUSES,
+        retry_statuses: frozenset[int] = _RETRYABLE_STATUSES,
         stream: bool = False,
         retry_sent_errors: Optional[bool] = None,
+        deadline: Optional[float] = None,
+        retry_window: Optional[float] = None,
     ) -> httpx.Response:
         """Отправляет запрос с повторами; возвращает успешный httpx.Response.
 
@@ -1368,50 +1681,49 @@ class NexusClient:
         /v1-запросы); по умолчанию False для стрима и True для остальных.
         """
         url = f"{self._base_url}{path}"
-        headers = _request_headers(self._api_key, auth, extra_headers)
-        idem_key = headers.get("Idempotency-Key")
+        headers = self._headers(auth, extra_headers)
+        idem_key = _get_header(headers, "Idempotency-Key")
         if retry_sent_errors is None:
             retry_sent_errors = not stream
 
-        attempt = 0
-        conflict_attempt = 0
-        conflict_deadline: Optional[float] = None
+        budget = _RetryBudget(self._max_retries, deadline, retry_window)
         while True:
             request = self._http.build_request(
                 method, url, json=json, params=params, headers=headers,
-                timeout=timeout if timeout is not None else httpx.USE_CLIENT_DEFAULT,
+                timeout=budget.attempt_timeout(timeout if timeout is not None else self._timeout),
             )
             try:
                 resp = self._http.send(request, stream=stream)
             except httpx.TransportError as e:
-                if _retryable_transport_error(e, retry_sent_errors) and attempt < self._max_retries:
-                    delay = _backoff_delay(attempt)
-                    _log_retry(method, path, attempt, self._max_retries, delay, type(e).__name__)
+                delay = _backoff_delay(budget.attempt)
+                if _retryable_transport_error(e, retry_sent_errors) and budget.can_retry(delay):
+                    _log_retry(method, path, budget.attempt, self._max_retries, delay, type(e).__name__)
                     time.sleep(delay)
-                    attempt += 1
+                    budget.attempt += 1
                     continue
-                raise _network_error(e, attempt, idem_key, stream) from e
+                raise _network_error(e, budget.attempt, idem_key, stream) from e
 
-            if resp.status_code in retry_statuses and attempt < self._max_retries:
-                delay = _retry_delay(resp, attempt)
-                resp.close()
-                _log_retry(method, path, attempt, self._max_retries, delay, f"HTTP {resp.status_code}")
-                time.sleep(delay)
-                attempt += 1
-                continue
+            if resp.status_code in retry_statuses:
+                delay = _retry_delay(resp, budget.attempt)
+                if budget.can_retry(delay):
+                    resp.close()
+                    _log_retry(method, path, budget.attempt, self._max_retries, delay, f"HTTP {resp.status_code}")
+                    time.sleep(delay)
+                    budget.attempt += 1
+                    continue
 
             # 409 после повтора самого SDK: первый запрос с этим ключом ещё
             # выполняется на сервере. Ждём его сохранённый ответ, а не сдаёмся.
-            if resp.status_code == 409 and idem_key and attempt > 0 and not stream:
+            if resp.status_code == 409 and idem_key and budget.attempt > 0 and not stream:
                 now = time.monotonic()
-                if conflict_deadline is None:
-                    conflict_deadline = now + _CONFLICT_WAIT_BUDGET
-                if now < conflict_deadline:
-                    delay = min(_backoff_delay(conflict_attempt), 5.0, conflict_deadline - now)
+                if budget.conflict_deadline is None:
+                    budget.conflict_deadline = now + _CONFLICT_WAIT_BUDGET
+                delay = min(_backoff_delay(budget.conflict_attempt), 5.0, budget.conflict_deadline - now)
+                if now < budget.conflict_deadline and budget.allows(delay):
                     resp.close()
-                    _log_retry(method, path, attempt, self._max_retries, delay, "HTTP 409 (in progress)")
+                    _log_retry(method, path, budget.attempt, self._max_retries, delay, "HTTP 409 (in progress)")
                     time.sleep(delay)
-                    conflict_attempt += 1
+                    budget.conflict_attempt += 1
                     continue
 
             if not resp.is_success:
@@ -1421,6 +1733,10 @@ class NexusClient:
                     finally:
                         resp.close()
                 raise _status_error(resp, idem_key)
+            logger.debug(
+                "%s %s -> %d (request_id=%s)", method, path, resp.status_code,
+                resp.headers.get("x-request-id"),
+            )
             return resp
 
     def _request(
@@ -1428,23 +1744,28 @@ class NexusClient:
         method: str,
         path: str,
         *,
-        json: Optional[dict] = None,
-        params: Optional[dict] = None,
+        json: Optional[dict[str, Any]] = None,
+        params: Optional[dict[str, Any]] = None,
         auth: bool = True,
-        extra_headers: Optional[dict] = None,
+        extra_headers: Optional[Mapping[str, str]] = None,
         timeout: Any = None,
-        retry_statuses: frozenset = _RETRYABLE_STATUSES,
+        retry_statuses: frozenset[int] = _RETRYABLE_STATUSES,
         retry_sent_errors: bool = True,
+        deadline: Optional[float] = None,
+        retry_window: Optional[float] = None,
     ) -> Any:
         resp = self._send(
             method, path, json=json, params=params, auth=auth,
             extra_headers=extra_headers, timeout=timeout,
             retry_statuses=retry_statuses, retry_sent_errors=retry_sent_errors,
+            deadline=deadline, retry_window=retry_window,
         )
-        return _decode_json(resp, (extra_headers or {}).get("Idempotency-Key"))
+        return _decode_json(resp, _get_header(extra_headers or {}, "Idempotency-Key"))
 
     def close(self) -> None:
-        self._http.close()
+        """Закрывает пул соединений (если его создал SDK, а не передали снаружи)."""
+        if self._owns_http:
+            self._http.close()
 
     def __enter__(self) -> "NexusClient":
         return self
@@ -1453,48 +1774,60 @@ class NexusClient:
         self.close()
 
 
-class AsyncNexusClient:
+class AsyncNexusClient(_ClientBase):
     """Главный async-клиент NexusAPI.
 
     Использование:
 
-        async with AsyncNexusClient(api_key="...") as client:
+        async with AsyncNexusClient() as client:  # ключ из NEXUSAPI_API_KEY
             task = await client.videos.create(model="veo-3-fast", prompt="...")
             await task.wait()
             print(task.video_url)
 
     Все методы — корутины. Параметры конструктора и публичный API идентичны
-    sync-варианту NexusClient.
+    sync-варианту NexusClient; `http_client` — httpx.AsyncClient.
     """
 
     def __init__(
         self,
-        api_key: str,
+        api_key: Optional[str] = None,
         *,
-        base_url: str = DEFAULT_BASE_URL,
-        timeout: float = DEFAULT_TIMEOUT,
+        base_url: Optional[str] = None,
+        timeout: Union[float, httpx.Timeout] = DEFAULT_TIMEOUT,
         max_retries: int = DEFAULT_MAX_RETRIES,
+        default_headers: Optional[Mapping[str, str]] = None,
+        http_client: Optional[httpx.AsyncClient] = None,
         transport: Optional[httpx.AsyncBaseTransport] = None,
     ):
-        if not api_key:
-            raise errors.AuthenticationError("api_key is required")
-        if max_retries < 0:
-            raise ValueError("max_retries must be >= 0")
-        self._api_key = api_key
-        self._base_url = _normalize_base_url(base_url)
-        self._timeout = timeout
-        self._max_retries = max_retries
-        self._http = httpx.AsyncClient(
-            timeout=timeout,
-            headers={"User-Agent": _USER_AGENT},
-            transport=transport,
-        )
+        if http_client is not None and transport is not None:
+            raise ValueError("pass either http_client or transport, not both")
+        self._configure(api_key, base_url, timeout, max_retries, default_headers)
+        self._owns_http = http_client is None
+        self._http = http_client or httpx.AsyncClient(timeout=timeout, transport=transport)
         self.videos = AsyncVideos(self)
         self.images = AsyncImages(self)
         self.tasks = AsyncTasks(self)
         self.models = AsyncModels(self)
         self.chat = AsyncChat(self)
         self.v1 = AsyncV1(self, self.chat)
+        self.webhooks = AsyncWebhooks(self)
+
+    def with_options(
+        self,
+        *,
+        timeout: Union[float, httpx.Timeout, NotGiven] = NOT_GIVEN,
+        max_retries: Union[int, NotGiven] = NOT_GIVEN,
+        default_headers: Union[Mapping[str, str], NotGiven] = NOT_GIVEN,
+    ) -> "AsyncNexusClient":
+        """Копия клиента с другими настройками на том же пуле соединений."""
+        return AsyncNexusClient(
+            self._api_key,
+            base_url=self._base_url,
+            timeout=self._timeout if isinstance(timeout, NotGiven) else timeout,
+            max_retries=self._max_retries if isinstance(max_retries, NotGiven) else max_retries,
+            default_headers=self._merged_headers(default_headers),
+            http_client=self._http,
+        )
 
     def _long_timeout(self, timeout: Optional[float]) -> httpx.Timeout:
         return _long_timeout(self._timeout, timeout)
@@ -1507,61 +1840,61 @@ class AsyncNexusClient:
         method: str,
         path: str,
         *,
-        json: Optional[dict] = None,
-        params: Optional[dict] = None,
+        json: Optional[dict[str, Any]] = None,
+        params: Optional[dict[str, Any]] = None,
         auth: bool = True,
-        extra_headers: Optional[dict] = None,
+        extra_headers: Optional[Mapping[str, str]] = None,
         timeout: Any = None,
-        retry_statuses: frozenset = _RETRYABLE_STATUSES,
+        retry_statuses: frozenset[int] = _RETRYABLE_STATUSES,
         stream: bool = False,
         retry_sent_errors: Optional[bool] = None,
+        deadline: Optional[float] = None,
+        retry_window: Optional[float] = None,
     ) -> httpx.Response:
         url = f"{self._base_url}{path}"
-        headers = _request_headers(self._api_key, auth, extra_headers)
-        idem_key = headers.get("Idempotency-Key")
+        headers = self._headers(auth, extra_headers)
+        idem_key = _get_header(headers, "Idempotency-Key")
         if retry_sent_errors is None:
             retry_sent_errors = not stream
 
-        loop = asyncio.get_running_loop()
-        attempt = 0
-        conflict_attempt = 0
-        conflict_deadline: Optional[float] = None
+        budget = _RetryBudget(self._max_retries, deadline, retry_window)
         while True:
             request = self._http.build_request(
                 method, url, json=json, params=params, headers=headers,
-                timeout=timeout if timeout is not None else httpx.USE_CLIENT_DEFAULT,
+                timeout=budget.attempt_timeout(timeout if timeout is not None else self._timeout),
             )
             try:
                 resp = await self._http.send(request, stream=stream)
             except httpx.TransportError as e:
-                if _retryable_transport_error(e, retry_sent_errors) and attempt < self._max_retries:
-                    delay = _backoff_delay(attempt)
-                    _log_retry(method, path, attempt, self._max_retries, delay, type(e).__name__)
+                delay = _backoff_delay(budget.attempt)
+                if _retryable_transport_error(e, retry_sent_errors) and budget.can_retry(delay):
+                    _log_retry(method, path, budget.attempt, self._max_retries, delay, type(e).__name__)
                     await asyncio.sleep(delay)
-                    attempt += 1
+                    budget.attempt += 1
                     continue
-                raise _network_error(e, attempt, idem_key, stream) from e
+                raise _network_error(e, budget.attempt, idem_key, stream) from e
 
-            if resp.status_code in retry_statuses and attempt < self._max_retries:
-                delay = _retry_delay(resp, attempt)
-                await resp.aclose()
-                _log_retry(method, path, attempt, self._max_retries, delay, f"HTTP {resp.status_code}")
-                await asyncio.sleep(delay)
-                attempt += 1
-                continue
+            if resp.status_code in retry_statuses:
+                delay = _retry_delay(resp, budget.attempt)
+                if budget.can_retry(delay):
+                    await resp.aclose()
+                    _log_retry(method, path, budget.attempt, self._max_retries, delay, f"HTTP {resp.status_code}")
+                    await asyncio.sleep(delay)
+                    budget.attempt += 1
+                    continue
 
             # 409 после повтора самого SDK: первый запрос с этим ключом ещё
             # выполняется на сервере. Ждём его сохранённый ответ, а не сдаёмся.
-            if resp.status_code == 409 and idem_key and attempt > 0 and not stream:
-                now = loop.time()
-                if conflict_deadline is None:
-                    conflict_deadline = now + _CONFLICT_WAIT_BUDGET
-                if now < conflict_deadline:
-                    delay = min(_backoff_delay(conflict_attempt), 5.0, conflict_deadline - now)
+            if resp.status_code == 409 and idem_key and budget.attempt > 0 and not stream:
+                now = time.monotonic()
+                if budget.conflict_deadline is None:
+                    budget.conflict_deadline = now + _CONFLICT_WAIT_BUDGET
+                delay = min(_backoff_delay(budget.conflict_attempt), 5.0, budget.conflict_deadline - now)
+                if now < budget.conflict_deadline and budget.allows(delay):
                     await resp.aclose()
-                    _log_retry(method, path, attempt, self._max_retries, delay, "HTTP 409 (in progress)")
+                    _log_retry(method, path, budget.attempt, self._max_retries, delay, "HTTP 409 (in progress)")
                     await asyncio.sleep(delay)
-                    conflict_attempt += 1
+                    budget.conflict_attempt += 1
                     continue
 
             if not resp.is_success:
@@ -1571,6 +1904,10 @@ class AsyncNexusClient:
                     finally:
                         await resp.aclose()
                 raise _status_error(resp, idem_key)
+            logger.debug(
+                "%s %s -> %d (request_id=%s)", method, path, resp.status_code,
+                resp.headers.get("x-request-id"),
+            )
             return resp
 
     async def _request(
@@ -1578,23 +1915,27 @@ class AsyncNexusClient:
         method: str,
         path: str,
         *,
-        json: Optional[dict] = None,
-        params: Optional[dict] = None,
+        json: Optional[dict[str, Any]] = None,
+        params: Optional[dict[str, Any]] = None,
         auth: bool = True,
-        extra_headers: Optional[dict] = None,
+        extra_headers: Optional[Mapping[str, str]] = None,
         timeout: Any = None,
-        retry_statuses: frozenset = _RETRYABLE_STATUSES,
+        retry_statuses: frozenset[int] = _RETRYABLE_STATUSES,
         retry_sent_errors: bool = True,
+        deadline: Optional[float] = None,
+        retry_window: Optional[float] = None,
     ) -> Any:
         resp = await self._send(
             method, path, json=json, params=params, auth=auth,
             extra_headers=extra_headers, timeout=timeout,
             retry_statuses=retry_statuses, retry_sent_errors=retry_sent_errors,
+            deadline=deadline, retry_window=retry_window,
         )
-        return _decode_json(resp, (extra_headers or {}).get("Idempotency-Key"))
+        return _decode_json(resp, _get_header(extra_headers or {}, "Idempotency-Key"))
 
     async def close(self) -> None:
-        await self._http.aclose()
+        if self._owns_http:
+            await self._http.aclose()
 
     async def __aenter__(self) -> "AsyncNexusClient":
         return self
@@ -1621,10 +1962,11 @@ def _log_retry(
 def _network_error(
     e: Exception, attempt: int, idem_key: Optional[str], stream: bool,
 ) -> errors.NetworkError:
+    reason = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
     if isinstance(e, _NOT_SENT_ERRORS):
-        message = f"Could not connect after {attempt + 1} attempts: {e}"
+        message = f"Could not connect after {attempt + 1} attempts: {reason}"
     else:
-        message = f"Network error after {attempt + 1} attempts: {e}"
+        message = f"Network error after {attempt + 1} attempts: {reason}"
         if stream:
             message += (
                 ". The request may have reached the server; a streamed response "
@@ -1632,19 +1974,41 @@ def _network_error(
             )
         elif idem_key:
             message += (
-                f". The request reached the server and may still be running (and be "
-                f"charged): repeat it with idempotency_key={idem_key!r}, not a new key — "
-                f"once it has finished successfully the server returns the stored result"
+                f". The request may still be running on the server: repeat it with "
+                f"idempotency_key={idem_key!r}, not a new key — the server returns the "
+                f"result of the first request instead of starting a new one"
             )
-    return errors.NetworkError(message, idempotency_key=idem_key)
+    cls = errors.APITimeoutError if isinstance(e, httpx.TimeoutException) else errors.NetworkError
+    return cls(message, idempotency_key=idem_key)
 
 
-def _status_error(resp: httpx.Response, idem_key: Optional[str]) -> errors.NexusError:
+def _status_error(resp: httpx.Response, idem_key: Optional[str]) -> errors.APIStatusError:
     message, cls, body = _parse_error(resp)
-    return cls(
+    err = cls(
         message, status_code=resp.status_code, response_body=body,
         idempotency_key=idem_key, headers=dict(resp.headers),
+        request_id=resp.headers.get("x-request-id"),
     )
+    if isinstance(body, dict) and isinstance(body.get("error"), dict):
+        detail = body["error"]
+        for name in ("code", "type", "param"):
+            value = detail.get(name)
+            if isinstance(value, str):
+                setattr(err, name, value)
+        # 504 у /v1/images: задача идёт и будет оплачена — её id.
+        task_id = detail.get("task_id")
+        if isinstance(task_id, str) and task_id:
+            err.task_id = task_id
+    return err
+
+
+def _require_secret(data: Any) -> str:
+    secret = data.get("secret") if isinstance(data, dict) else None
+    if not isinstance(secret, str) or not secret:
+        raise errors.APIResponseValidationError(
+            "Server response has no webhook secret", response_body=data,
+        )
+    return secret
 
 
 def _decode_json(resp: httpx.Response, idem_key: Optional[str]) -> Any:
@@ -1657,6 +2021,7 @@ def _decode_json(resp: httpx.Response, idem_key: Optional[str]) -> Any:
             f"Invalid JSON in HTTP {resp.status_code} response",
             status_code=resp.status_code, response_body=_truncate(resp.text, 2000),
             idempotency_key=idem_key, headers=dict(resp.headers),
+            request_id=resp.headers.get("x-request-id"),
         ) from e
 
 
@@ -1674,15 +2039,6 @@ def _normalize_base_url(base_url: str) -> str:
             stacklevel=3,
         )
     return url
-
-
-def _request_headers(api_key: str, auth: bool, extra_headers: Optional[dict]) -> dict[str, str]:
-    headers: dict[str, str] = {}
-    if auth:
-        headers["Authorization"] = f"Bearer {api_key}"
-    if extra_headers:
-        headers.update(extra_headers)
-    return headers
 
 
 def _long_timeout(

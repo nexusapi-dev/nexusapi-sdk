@@ -1,14 +1,19 @@
 export {
+  ENV_API_KEY,
+  ENV_BASE_URL,
   NexusClient,
   Task,
   VERSION,
   type ClientOptions,
+  type ClientOverrides,
   type ImageGenerateParams,
   type ModelInfo,
   type PriceUnit,
   type PricingOption,
+  type RequestOptions,
   type TaskResult,
   type TaskStatus,
+  type UnwrapWebhookOptions,
   type VideoCreateParams,
   type WaitOptions,
 } from "./client.js";
@@ -32,10 +37,26 @@ export {
 } from "./v1.js";
 
 export {
+  DEFAULT_WEBHOOK_TOLERANCE_SECONDS,
+  SIGNATURE_HEADER,
+  TIMESTAMP_HEADER,
+  unwrapWebhook,
+  verifyWebhookSignature,
+  webhookSecretFromApiKey,
+  type VerifyWebhookOptions,
+  type WebhookEvent,
+  type WebhookHeaders,
+  type WebhookPayload,
+} from "./webhooks.js";
+
+export {
   APIResponseValidationError,
+  APIStatusError,
+  APITimeoutError,
   AuthenticationError,
   BillingError,
   ConflictError,
+  InternalServerError,
   NetworkError,
   NexusError,
   NotFoundError,
@@ -45,4 +66,5 @@ export {
   TaskFailedError,
   TaskTimeoutError,
   ValidationError,
+  WebhookVerificationError,
 } from "./errors.js";

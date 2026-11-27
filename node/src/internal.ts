@@ -3,7 +3,49 @@
  * Не экспортируются из пакета.
  */
 
+import type { RequestOptions, TransportOptions } from "./client.js";
 import { NetworkError, NexusError } from "./errors.js";
+
+/** RequestOptions (публичные) → опции транспорта. Явный timeoutMs — общий лимит вызова. */
+export function requestTransport(options: RequestOptions): TransportOptions {
+  return {
+    signal: options.signal,
+    timeoutMs: options.timeoutMs,
+    deadlineMs: deadlineFrom(options.timeoutMs),
+    maxRetries: options.maxRetries,
+    extraHeaders: options.headers,
+  };
+}
+
+export function deadlineFrom(timeoutMs: number | undefined): number | undefined {
+  return timeoutMs === undefined ? undefined : Date.now() + timeoutMs;
+}
+
+/** Ставит заголовок без учёта регистра: `authorization` и `Authorization` — один заголовок. */
+export function setHeader(headers: Record<string, string>, name: string, value: string): void {
+  const lower = name.toLowerCase();
+  for (const key of Object.keys(headers)) {
+    if (key.toLowerCase() === lower) delete headers[key];
+  }
+  headers[name] = value;
+}
+
+export function getHeader(headers: Record<string, string> | undefined, name: string): string | undefined {
+  if (!headers) return undefined;
+  const lower = name.toLowerCase();
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.toLowerCase() === lower) return value;
+  }
+  return undefined;
+}
+
+/**
+ * Ключ идемпотентности вызова: `idempotencyKey` из параметров, иначе
+ * Idempotency-Key из заголовков вызова (регистр не важен), иначе новый.
+ */
+export function resolveIdempotencyKey(paramKey: string | undefined, headers: Record<string, string> | undefined): string {
+  return generateIdempotencyKey(paramKey ?? getHeader(headers, "Idempotency-Key"));
+}
 
 /** Ошибка опроса, которую стоит переждать, а не прерывать ожидание задачи. */
 export function isTransientError(e: unknown): boolean {
@@ -15,10 +57,30 @@ export function isTransientError(e: unknown): boolean {
 // нестабильность которая может пройти сама.
 export const RETRYABLE_STATUSES: ReadonlySet<number> = new Set([429, 500, 502, 503, 504]);
 
-// Для долгих синхронных /v1-запросов (чат, /v1/images/generations) 500/502/504
-// НЕ повторяем: сервер мог уже создать платную задачу (504 у /v1/images значит
-// «задача ещё идёт»), а 5xx не кэшируется по Idempotency-Key — повтор создал бы
-// вторую задачу и второе списание. 429 и 503 приходят до создания задачи.
+// Генерации (/generate, /v1/images, /v1/videos) сервер привязывает к
+// Idempotency-Key: повтор после 5xx или обрыва возвращает ту же задачу, а у
+// /v1/images 504 повтор продолжает ждать её — их повторяем как обычно.
+//
+// Чат к задаче не привязан: сервер хранит только успешный ответ, а 500 мог
+// прийти после вызова модели — его не повторяем. 502/504 приходят от прокси,
+// пока сервер ещё работает: повтор с тем же ключом получит 409 (SDK подождёт)
+// или сохранённый ответ.
+export const CHAT_RETRY_STATUSES: ReadonlySet<number> = new Set([429, 502, 504]);
+// 503 у чата сервер отдаёт и после неудачного вызова поставщика модели (в т.ч.
+// по таймауту): ответ не сохраняется, и повтор снова платно отправил бы запрос
+// поставщику. Поэтому 503 у чата не повторяем.
+
+// Замок Idempotency-Key на сервере живёт 600 с: после этого повтор чата мог бы
+// запустить модель второй раз, пока первый запрос ещё идёт. Повторы и ожидание
+// 409 для чата — только в первые 540 с вызова.
+export const CHAT_RETRY_WINDOW_MS = 540_000;
+
+// У /v1/images 500 означает, что задача завершилась ошибкой: повтор с тем же
+// ключом вернёт ту же упавшую задачу. Остальные 5xx повторяем.
+export const IMAGES_RETRY_STATUSES: ReadonlySet<number> = new Set([429, 502, 503, 504]);
+
+// SSE-стрим сервер не сохраняет вовсе: повторяем только ответы, пришедшие до
+// начала генерации.
 export const SAFE_RETRY_STATUSES: ReadonlySet<number> = new Set([429, 503]);
 
 // Чат и /v1/images/generations сервер держит долго: картинки до 180 с
@@ -154,6 +216,20 @@ const NOT_SENT_CODES = new Set([
   "EHOSTUNREACH",
   "UND_ERR_CONNECT_TIMEOUT",
 ]);
+
+// Таймауты undici: заголовки/тело/подключение не дождались.
+const TIMEOUT_CODES = new Set(["UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT", "UND_ERR_CONNECT_TIMEOUT"]);
+
+export function isTimeoutError(e: unknown): boolean {
+  let cur: unknown = e;
+  for (let depth = 0; cur && depth < 4; depth += 1) {
+    const code = (cur as { code?: unknown }).code;
+    if (typeof code === "string" && TIMEOUT_CODES.has(code)) return true;
+    if ((cur as { name?: unknown }).name === "TimeoutError") return true;
+    cur = (cur as { cause?: unknown }).cause;
+  }
+  return false;
+}
 
 export function isNotSentError(e: unknown): boolean {
   let cur: unknown = e;

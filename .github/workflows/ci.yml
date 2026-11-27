@@ -20,18 +20,18 @@ concurrency:
 jobs:
   python:
     name: Python ${{ matrix.python-version }}${{ matrix.httpx && format(' / httpx {0}', matrix.httpx) || '' }}
-    # setup-python has no Python 3.9 build for the newest ubuntu-latest image
-    # (3.9 is end-of-life), so 3.9 jobs run on Ubuntu 24.04.
-    runs-on: ${{ matrix.python-version == '3.9' && 'ubuntu-24.04' || 'ubuntu-latest' }}
+    # The oldest supported Python is end-of-life and may have no build for the
+    # newest ubuntu-latest image, so it runs on Ubuntu 24.04.
+    runs-on: ${{ matrix.python-version == '3.10' && 'ubuntu-24.04' || 'ubuntu-latest' }}
     timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
         httpx: [""] # "" = latest
         include:
           # Extra job: oldest supported httpx from pyproject.toml.
-          - python-version: "3.9"
+          - python-version: "3.10"
             httpx: "0.24.*"
     defaults:
       run:
@@ -68,8 +68,8 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m pip install "build>=1.2,<2" "twine>=6,<7" "mypy>=1.10,<2" -e .
-      - name: Type check
-        run: python -m mypy nexusapi
+      - name: Type check (strict)
+        run: python -m mypy --strict nexusapi
       - run: python -m build
       - run: python -m twine check --strict dist/*
 
@@ -80,7 +80,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node-version: ["18", "20", "22", "24", "26"]
+        node-version: ["20", "22", "24", "26"]
     defaults:
       run:
         working-directory: node
@@ -96,9 +96,12 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm test
       - run: npm pack --dry-run
-      - name: Lint package (publint)
+      - name: Lint package (publint, arethetypeswrong)
         if: matrix.node-version == '22'
-        run: npx --yes publint@0.3.25
+        run: |
+          npm pack --ignore-scripts
+          npx --yes publint@0.3.25 ./nexusapi-sdk-*.tgz
+          npx --yes @arethetypeswrong/cli@0.18.5 ./nexusapi-sdk-*.tgz
 
   versions:
     name: Versions in sync
