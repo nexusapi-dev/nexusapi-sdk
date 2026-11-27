@@ -22,9 +22,12 @@
 
 import {
   APIResponseValidationError,
+  APIStatusError,
+  APITimeoutError,
   AuthenticationError,
   BillingError,
   ConflictError,
+  InternalServerError,
   NetworkError,
   NexusError,
   NotFoundError,
@@ -43,18 +46,31 @@ import {
   isNotSentError,
   isTransientError,
   MAX_TIMER_MS,
+  requestTransport,
   parseRetryAfterMs,
   RETRYABLE_STATUSES,
   sleep,
   truncate,
 } from "./internal.js";
 import { Chat, V1 } from "./v1.js";
+import {
+  unwrapWebhook,
+  verifyWebhookSignature,
+  webhookSecretFromApiKey,
+  type VerifyWebhookOptions,
+  type WebhookEvent,
+  type WebhookHeaders,
+  type WebhookPayload,
+} from "./webhooks.js";
 
 const DEFAULT_BASE_URL = "https://nexusapi.dev";
 const DEFAULT_TIMEOUT_MS = 60_000;
 const DEFAULT_MAX_RETRIES = 2;
+/** Переменные окружения, из которых клиент берёт ключ и адрес API. */
+export const ENV_API_KEY = "NEXUSAPI_API_KEY";
+export const ENV_BASE_URL = "NEXUSAPI_BASE_URL";
 /** Версия SDK (уходит в User-Agent). Тест сверяет её с package.json. */
-export const VERSION = "0.3.1";
+export const VERSION = "0.4.0";
 
 // ============================================================
 // Типы
@@ -142,7 +158,9 @@ export interface ModelInfo {
 }
 
 export interface ClientOptions {
-  apiKey: string;
+  /** Ключ API. По умолчанию — переменная окружения NEXUSAPI_API_KEY. */
+  apiKey?: string;
+  /** По умолчанию NEXUSAPI_BASE_URL или https://nexusapi.dev. */
   baseUrl?: string;
   /**
    * Таймаут запроса, мс (вместе с чтением ответа). Default 60000. Для
@@ -152,7 +170,9 @@ export interface ClientOptions {
   timeoutMs?: number;
   /** Max retry attempts on 5xx/429/network errors. Default 2. 0 to disable. */
   maxRetries?: number;
-  /** Override fetch (for tests/proxies). Default = globalThis.fetch. */
+  /** Заголовки для каждого запроса. */
+  defaultHeaders?: Record<string, string>;
+  /** Свой fetch (прокси, тесты, undici Agent). Default = globalThis.fetch. */
   fetch?: typeof fetch;
 }
 
@@ -160,7 +180,7 @@ export interface ClientOptions {
 // Helpers (shared)
 // ============================================================
 
-type ErrorClass = new (message: string, status?: number, body?: unknown) => NexusError;
+type ErrorClass = new (message: string, status?: number, body?: unknown) => APIStatusError;
 
 const STATUS_ERRORS: Record<number, ErrorClass> = {
   400: ValidationError,
@@ -212,17 +232,27 @@ function headersToObject(headers: Headers): Record<string, string> {
   return out;
 }
 
-function statusError(resp: Response, text: string, idempotencyKey?: string): NexusError {
+function statusError(resp: Response, text: string, idempotencyKey?: string): APIStatusError {
   let body: unknown;
   try {
     body = text ? JSON.parse(text) : undefined;
   } catch {
     body = text ? truncate(text, 2000) : undefined;
   }
-  const ErrorCtor = STATUS_ERRORS[resp.status] ?? NexusError;
+  const ErrorCtor = STATUS_ERRORS[resp.status] ?? (resp.status >= 500 ? InternalServerError : APIStatusError);
   const err = new ErrorCtor(errorMessage(body, text, resp.status), resp.status, body);
   err.headers = headersToObject(resp.headers);
+  err.requestId = resp.headers.get("x-request-id") ?? undefined;
   err.idempotencyKey = idempotencyKey;
+  const detail = (body as { error?: unknown } | undefined)?.error;
+  if (detail && typeof detail === "object") {
+    const d = detail as Record<string, unknown>;
+    if (typeof d.code === "string") err.code = d.code;
+    if (typeof d.type === "string") err.type = d.type;
+    if (typeof d.param === "string") err.param = d.param;
+    // 504 у /v1/images: задача идёт и будет оплачена — её id.
+    if (typeof d.task_id === "string" && d.task_id) err.taskId = d.task_id;
+  }
   return err;
 }
 
@@ -273,6 +303,12 @@ function normalizeBaseUrl(baseUrl: string): string {
     proc?.emitWarning?.(`nexusapi-sdk: baseUrl should not end with /v1 (the SDK adds it where needed); using ${url}`);
   }
   return url;
+}
+
+function validateMaxRetries(value: number): void {
+  if (!Number.isInteger(value) || value < 0) {
+    throw new Error("maxRetries must be >= 0 (an integer)");
+  }
 }
 
 function validateTimeout(name: string, value: number): void {
@@ -436,17 +472,31 @@ export class Task {
 // Resources
 // ============================================================
 
+/** Настройки одного вызова — второй аргумент любого метода. */
+export interface RequestOptions {
+  /** Отмена запроса (для wait/generate — и ожидания задачи). */
+  signal?: AbortSignal;
+  /** Таймаут этого запроса, мс (вместе с чтением ответа). */
+  timeoutMs?: number;
+  /** Сколько раз повторить этот запрос при 429/5xx/сетевых ошибках. */
+  maxRetries?: number;
+  /** Дополнительные заголовки этого запроса. */
+  headers?: Record<string, string>;
+}
+
 class Videos {
   constructor(private readonly client: NexusClient) {}
 
-  async create(params: VideoCreateParams): Promise<Task> {
+  async create(params: VideoCreateParams, options: RequestOptions = {}): Promise<Task> {
     const { model, prompt, duration, aspect_ratio, idempotencyKey, ...extras } = params;
     const apiParams = buildGenerateParams(model, prompt, { duration, aspect_ratio }, extras);
     const key = generateIdempotencyKey(idempotencyKey);
     const data = await this.client._request<unknown>("POST", "/generate", {
       body: { params: apiParams },
-      extraHeaders: { "Idempotency-Key": key },
-      timeoutMs: this.client._generateTimeoutMs(),
+      extraHeaders: { ...options.headers, "Idempotency-Key": key },
+      timeoutMs: options.timeoutMs ?? this.client._generateTimeoutMs(),
+      maxRetries: options.maxRetries,
+      signal: options.signal,
     });
     return new Task(this.client, { id: requireTaskId(data, key), status: "pending", model });
   }
@@ -455,7 +505,7 @@ class Videos {
 class Images {
   constructor(private readonly client: NexusClient) {}
 
-  async generate(params: ImageGenerateParams): Promise<Task> {
+  async generate(params: ImageGenerateParams, options: RequestOptions = {}): Promise<Task> {
     const {
       model,
       prompt,
@@ -470,12 +520,14 @@ class Images {
     const key = generateIdempotencyKey(idempotencyKey);
     const data = await this.client._request<unknown>("POST", "/generate", {
       body: { params: apiParams },
-      extraHeaders: { "Idempotency-Key": key },
-      timeoutMs: this.client._generateTimeoutMs(),
+      extraHeaders: { ...options.headers, "Idempotency-Key": key },
+      timeoutMs: options.timeoutMs ?? this.client._generateTimeoutMs(),
+      maxRetries: options.maxRetries,
+      signal: options.signal,
     });
     const task = new Task(this.client, { id: requireTaskId(data, key), status: "pending", model });
     if (wait) {
-      await task.wait(timeout, pollInterval);
+      await task.wait({ timeoutMs: timeout, pollIntervalMs: pollInterval, signal: options.signal });
     }
     return task;
   }
@@ -484,7 +536,7 @@ class Images {
 class Tasks {
   constructor(private readonly client: NexusClient) {}
 
-  async get(taskId: string, options: { signal?: AbortSignal } = {}): Promise<Task> {
+  async get(taskId: string, options: RequestOptions = {}): Promise<Task> {
     if (!taskId) throw new TypeError("taskId is required");
     const data = await this.client._request<{
       task_id?: string;
@@ -492,7 +544,7 @@ class Tasks {
       result?: TaskResult;
       error?: string;
       created_at?: string;
-    }>("GET", `/tasks/${encodeURIComponent(taskId)}`, { signal: options.signal });
+    }>("GET", `/tasks/${encodeURIComponent(taskId)}`, requestTransport(options));
     const id = requireTaskId(data);
     if (typeof data.status !== "string") {
       throw new APIResponseValidationError("Server response has no task status", undefined, data);
@@ -510,8 +562,56 @@ class Tasks {
 class Models {
   constructor(private readonly client: NexusClient) {}
 
-  async list(): Promise<ModelInfo[]> {
-    return this.client._request<ModelInfo[]>("GET", "/public/models", { auth: false });
+  async list(options: RequestOptions = {}): Promise<ModelInfo[]> {
+    const data = await this.client._request<ModelInfo[] | undefined>("GET", "/public/models", {
+      ...requestTransport(options),
+      auth: false,
+    });
+    return data ?? [];
+  }
+}
+
+export interface UnwrapWebhookOptions extends VerifyWebhookOptions {
+  /** Секрет `whsec_…`. По умолчанию — секрет ключа этого клиента. */
+  secret?: string;
+}
+
+/**
+ * Подпись вебхуков: секрет и проверка входящих запросов. Если сервис,
+ * принимающий вебхуки, знает API-ключ — `client.webhooks.unwrap(body, headers)`.
+ * Сервису без ключа — `unwrapWebhook(body, headers, secret)` с секретом из
+ * `client.webhooks.secret()`.
+ */
+class Webhooks {
+  constructor(private readonly client: NexusClient) {}
+
+  /** GET /webhooks/secret — секрет `whsec_…` для задач этого ключа. */
+  async secret(options: RequestOptions = {}): Promise<string> {
+    const data = await this.client._request<{ secret?: unknown }>("GET", "/webhooks/secret", requestTransport(options));
+    if (typeof data?.secret !== "string" || !data.secret) {
+      throw new APIResponseValidationError("Server response has no webhook secret", undefined, data);
+    }
+    return data.secret;
+  }
+
+  /** Проверяет подпись и возвращает событие. `payload` — сырое тело запроса. */
+  async unwrap(
+    payload: WebhookPayload,
+    headers: WebhookHeaders,
+    options: UnwrapWebhookOptions = {},
+  ): Promise<WebhookEvent> {
+    const { secret, ...verify } = options;
+    return unwrapWebhook(payload, headers, secret ?? (await this.client._webhookSecret()), verify);
+  }
+
+  /** Только проверка подписи (без разбора тела). */
+  async verifySignature(
+    payload: WebhookPayload,
+    headers: WebhookHeaders,
+    options: UnwrapWebhookOptions = {},
+  ): Promise<void> {
+    const { secret, ...verify } = options;
+    await verifyWebhookSignature(payload, headers, secret ?? (await this.client._webhookSecret()), verify);
   }
 }
 
@@ -520,16 +620,17 @@ class Models {
 // ============================================================
 
 /** @internal Опции транспорта. */
-export interface RequestOptions {
+export interface TransportOptions {
   body?: unknown;
   auth?: boolean;
   extraHeaders?: Record<string, string>;
   /** Таймаут запроса, мс: для обычных запросов — вместе с чтением тела, для стрима — до заголовков. */
   timeoutMs?: number;
+  maxRetries?: number;
   retryStatuses?: ReadonlySet<number>;
   /**
    * Повторять ли сетевые ошибки, когда запрос мог уже дойти до сервера.
-   * По умолчанию true, для стрима false; долгие /v1-запросы передают false.
+   * По умолчанию true, для стрима false.
    */
   retrySentErrors?: boolean;
   signal?: AbortSignal;
@@ -544,12 +645,31 @@ export interface SendResult {
   cleanup: () => void;
 }
 
+/** Настройки для `client.withOptions()`. */
+export interface ClientOverrides {
+  timeoutMs?: number;
+  maxRetries?: number;
+  /** Дополняют заголовки клиента. */
+  defaultHeaders?: Record<string, string>;
+}
+
+function runtimeEnv(): Record<string, string | undefined> {
+  return (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env ?? {};
+}
+
+function userAgent(): string {
+  const node = (globalThis as { process?: { versions?: { node?: string } } }).process?.versions?.node;
+  return node ? `nexusapi-node/${VERSION} node/${node}` : `nexusapi-node/${VERSION}`;
+}
+
 export class NexusClient {
   // #private: ключ не виден в console.log / util.inspect / JSON.
   readonly #apiKey: string;
+  #webhookSecret?: Promise<string>;
   private readonly baseUrl: string;
   private readonly timeoutMs: number;
   private readonly maxRetries: number;
+  private readonly defaultHeaders: Record<string, string>;
   private readonly fetchImpl: typeof fetch;
 
   readonly videos: Videos;
@@ -560,21 +680,28 @@ export class NexusClient {
   readonly chat: Chat;
   /** OpenAI-совместимые /v1/models, /v1/images/generations, /v1/videos. */
   readonly v1: V1;
+  /** Секрет и проверка подписи вебхуков. */
+  readonly webhooks: Webhooks;
 
-  constructor(opts: ClientOptions) {
-    if (!opts.apiKey) {
-      throw new AuthenticationError("apiKey is required");
+  /**
+   * @param opts.apiKey ключ API; по умолчанию — переменная окружения NEXUSAPI_API_KEY
+   * @param opts.baseUrl по умолчанию NEXUSAPI_BASE_URL или https://nexusapi.dev
+   */
+  constructor(opts: ClientOptions = {}) {
+    const env = runtimeEnv();
+    const apiKey = opts.apiKey ?? env[ENV_API_KEY];
+    if (!apiKey) {
+      throw new AuthenticationError(`apiKey is required: pass { apiKey } or set the ${ENV_API_KEY} environment variable`);
     }
     const maxRetries = opts.maxRetries ?? DEFAULT_MAX_RETRIES;
-    if (!Number.isInteger(maxRetries) || maxRetries < 0) {
-      throw new Error("maxRetries must be >= 0 (an integer)");
-    }
+    validateMaxRetries(maxRetries);
     const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     validateTimeout("timeoutMs", timeoutMs);
-    this.#apiKey = opts.apiKey;
-    this.baseUrl = normalizeBaseUrl(opts.baseUrl ?? DEFAULT_BASE_URL);
+    this.#apiKey = apiKey;
+    this.baseUrl = normalizeBaseUrl(opts.baseUrl ?? env[ENV_BASE_URL] ?? DEFAULT_BASE_URL);
     this.timeoutMs = timeoutMs;
     this.maxRetries = maxRetries;
+    this.defaultHeaders = { ...opts.defaultHeaders };
     this.fetchImpl = opts.fetch ?? globalThis.fetch.bind(globalThis);
 
     this.videos = new Videos(this);
@@ -583,6 +710,29 @@ export class NexusClient {
     this.models = new Models(this);
     this.chat = new Chat(this);
     this.v1 = new V1(this, this.chat);
+    this.webhooks = new Webhooks(this);
+  }
+
+  /**
+   * Копия клиента с другими настройками:
+   * `client.withOptions({ timeoutMs: 10_000, maxRetries: 0 }).videos.create(...)`.
+   * Заголовки дополняют текущие.
+   */
+  withOptions(overrides: ClientOverrides = {}): NexusClient {
+    return new NexusClient({
+      apiKey: this.#apiKey,
+      baseUrl: this.baseUrl,
+      timeoutMs: overrides.timeoutMs ?? this.timeoutMs,
+      maxRetries: overrides.maxRetries ?? this.maxRetries,
+      defaultHeaders: { ...this.defaultHeaders, ...overrides.defaultHeaders },
+      fetch: this.fetchImpl,
+    });
+  }
+
+  /** @internal Секрет вебхуков, вычисленный из ключа (кэшируется). */
+  _webhookSecret(): Promise<string> {
+    this.#webhookSecret ??= webhookSecretFromApiKey(this.#apiKey);
+    return this.#webhookSecret;
   }
 
   /** @internal Таймаут долгого /v1-запроса: явный или не меньше 600000 мс. */
@@ -604,21 +754,22 @@ export class NexusClient {
    * stream=true: таймаут действует только до заголовков, тело читает Stream;
    * повтор при сетевой ошибке — только если запрос точно не ушёл.
    */
-  async _send(method: string, path: string, opts: RequestOptions & { stream?: boolean } = {}): Promise<SendResult> {
+  async _send(method: string, path: string, opts: TransportOptions & { stream?: boolean } = {}): Promise<SendResult> {
     const {
       body,
       auth = true,
       extraHeaders,
-      timeoutMs = this.timeoutMs,
       retryStatuses = RETRYABLE_STATUSES,
       signal,
       stream = false,
     } = opts;
+    const timeoutMs = opts.timeoutMs ?? this.timeoutMs;
+    validateTimeout("timeoutMs", timeoutMs);
+    const maxRetries = opts.maxRetries ?? this.maxRetries;
+    validateMaxRetries(maxRetries);
     const retrySentErrors = opts.retrySentErrors ?? !stream;
     const url = `${this.baseUrl}${path}`;
-    const headers: Record<string, string> = {
-      "User-Agent": `nexusapi-node/${VERSION}`,
-    };
+    const headers: Record<string, string> = { "User-Agent": userAgent(), ...this.defaultHeaders };
     if (body !== undefined) headers["Content-Type"] = "application/json";
     if (auth) headers.Authorization = `Bearer ${this.#apiKey}`;
     if (extraHeaders) Object.assign(headers, extraHeaders);
@@ -660,7 +811,7 @@ export class NexusClient {
         // Отмена пользователем — не повторяем, пробрасываем как есть (AbortError).
         if (signal?.aborted) throw e;
         const notSent = isNotSentError(e);
-        if ((retrySentErrors || notSent) && attempt < this.maxRetries) {
+        if ((retrySentErrors || notSent) && attempt < maxRetries) {
           await sleep(backoffDelayMs(attempt), signal);
           attempt += 1;
           continue;
@@ -670,7 +821,7 @@ export class NexusClient {
       clearTimeout(timeoutHandle);
       if (!stream || !resp.ok) cleanup();
 
-      if (retryStatuses.has(resp.status) && attempt < this.maxRetries) {
+      if (retryStatuses.has(resp.status) && attempt < maxRetries) {
         await sleep(parseRetryAfterMs(resp.headers) ?? backoffDelayMs(attempt), signal);
         attempt += 1;
         continue;
@@ -695,10 +846,9 @@ export class NexusClient {
 
   /**
    * @internal
-   * Generic typed request helper. Use the public videos/images/tasks/models
-   * resources from user code.
+   * Generic typed request helper. Use the public resources from user code.
    */
-  async _request<T = unknown>(method: string, path: string, opts: RequestOptions = {}): Promise<T> {
+  async _request<T = unknown>(method: string, path: string, opts: TransportOptions = {}): Promise<T> {
     const { response, text } = await this._send(method, path, opts);
     if (response.status === 204 || !text) return undefined as T;
     try {
@@ -710,6 +860,7 @@ export class NexusClient {
         truncate(text, 2000),
       );
       err.headers = headersToObject(response.headers);
+      err.requestId = response.headers.get("x-request-id") ?? undefined;
       err.idempotencyKey = opts.extraHeaders?.["Idempotency-Key"];
       throw err;
     }
@@ -737,14 +888,13 @@ function networkError(
       message += ". The request may have reached the server; a streamed response cannot be replayed";
     } else if (ctx.idempotencyKey) {
       message +=
-        `. The request reached the server and may still be running (and be charged): repeat it with ` +
-        `idempotencyKey "${ctx.idempotencyKey}", not a new key — once it has finished successfully ` +
-        `the server returns the stored result`;
+        `. The request may still be running on the server: repeat it with idempotencyKey ` +
+        `"${ctx.idempotencyKey}", not a new key — the server returns the result of the first request ` +
+        `instead of starting a new one`;
     }
   }
-  const err = new NetworkError(message);
+  const err = ctx.timedOut ? new APITimeoutError(message) : new NetworkError(message);
   err.idempotencyKey = ctx.idempotencyKey;
   (err as { cause?: unknown }).cause = e;
   return err;
 }
-

@@ -3,7 +3,18 @@
  * Не экспортируются из пакета.
  */
 
+import type { RequestOptions, TransportOptions } from "./client.js";
 import { NetworkError, NexusError } from "./errors.js";
+
+/** RequestOptions (публичные) → опции транспорта. */
+export function requestTransport(options: RequestOptions): TransportOptions {
+  return {
+    signal: options.signal,
+    timeoutMs: options.timeoutMs,
+    maxRetries: options.maxRetries,
+    extraHeaders: options.headers,
+  };
+}
 
 /** Ошибка опроса, которую стоит переждать, а не прерывать ожидание задачи. */
 export function isTransientError(e: unknown): boolean {
@@ -15,10 +26,18 @@ export function isTransientError(e: unknown): boolean {
 // нестабильность которая может пройти сама.
 export const RETRYABLE_STATUSES: ReadonlySet<number> = new Set([429, 500, 502, 503, 504]);
 
-// Для долгих синхронных /v1-запросов (чат, /v1/images/generations) 500/502/504
-// НЕ повторяем: сервер мог уже создать платную задачу (504 у /v1/images значит
-// «задача ещё идёт»), а 5xx не кэшируется по Idempotency-Key — повтор создал бы
-// вторую задачу и второе списание. 429 и 503 приходят до создания задачи.
+// Генерации (/generate, /v1/images, /v1/videos) сервер привязывает к
+// Idempotency-Key: повтор после 5xx или обрыва возвращает ту же задачу, а у
+// /v1/images 504 повтор продолжает ждать её — их повторяем как обычно.
+//
+// Чат к задаче не привязан: сервер хранит только успешный ответ, а 500 мог
+// прийти после вызова модели — его не повторяем. 502/504 приходят от прокси,
+// пока сервер ещё работает: повтор с тем же ключом получит 409 (SDK подождёт)
+// или сохранённый ответ.
+export const CHAT_RETRY_STATUSES: ReadonlySet<number> = new Set([429, 502, 503, 504]);
+
+// SSE-стрим сервер не сохраняет вовсе: повторяем только ответы, пришедшие до
+// начала генерации.
 export const SAFE_RETRY_STATUSES: ReadonlySet<number> = new Set([429, 503]);
 
 // Чат и /v1/images/generations сервер держит долго: картинки до 180 с
