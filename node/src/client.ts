@@ -253,7 +253,11 @@ function requireTaskId(data: unknown, idempotencyKey?: string): string {
 }
 
 function normalizeBaseUrl(baseUrl: string): string {
-  let url = baseUrl.replace(/\/+$/, "");
+  // Срезаем завершающие "/" циклом, а не /\/+$/: у такого регэкспа
+  // квадратичное время на строках из множества "/" (CodeQL js/polynomial-redos).
+  let end = baseUrl.length;
+  while (end > 0 && baseUrl.charCodeAt(end - 1) === 47) end -= 1;
+  let url = baseUrl.slice(0, end);
   let parsed: URL;
   try {
     parsed = new URL(url);
