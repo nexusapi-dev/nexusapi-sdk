@@ -42,11 +42,15 @@ import {
   CONFLICT_WAIT_BUDGET_MS,
   DEFAULT_GENERATE_TIMEOUT_MS,
   DEFAULT_LONG_TIMEOUT_MS,
-  generateIdempotencyKey,
   isNotSentError,
+  deadlineFrom,
+  getHeader,
+  isTimeoutError,
   isTransientError,
   MAX_TIMER_MS,
   requestTransport,
+  resolveIdempotencyKey,
+  setHeader,
   parseRetryAfterMs,
   RETRYABLE_STATUSES,
   sleep,
@@ -490,11 +494,12 @@ class Videos {
   async create(params: VideoCreateParams, options: RequestOptions = {}): Promise<Task> {
     const { model, prompt, duration, aspect_ratio, idempotencyKey, ...extras } = params;
     const apiParams = buildGenerateParams(model, prompt, { duration, aspect_ratio }, extras);
-    const key = generateIdempotencyKey(idempotencyKey);
+    const key = resolveIdempotencyKey(idempotencyKey, options.headers);
     const data = await this.client._request<unknown>("POST", "/generate", {
       body: { params: apiParams },
       extraHeaders: { ...options.headers, "Idempotency-Key": key },
       timeoutMs: options.timeoutMs ?? this.client._generateTimeoutMs(),
+      deadlineMs: deadlineFrom(options.timeoutMs),
       maxRetries: options.maxRetries,
       signal: options.signal,
     });
@@ -517,11 +522,12 @@ class Images {
       ...extras
     } = params;
     const apiParams = buildGenerateParams(model, prompt, { aspect_ratio }, extras);
-    const key = generateIdempotencyKey(idempotencyKey);
+    const key = resolveIdempotencyKey(idempotencyKey, options.headers);
     const data = await this.client._request<unknown>("POST", "/generate", {
       body: { params: apiParams },
       extraHeaders: { ...options.headers, "Idempotency-Key": key },
       timeoutMs: options.timeoutMs ?? this.client._generateTimeoutMs(),
+      deadlineMs: deadlineFrom(options.timeoutMs),
       maxRetries: options.maxRetries,
       signal: options.signal,
     });
@@ -626,6 +632,10 @@ export interface TransportOptions {
   extraHeaders?: Record<string, string>;
   /** Таймаут запроса, мс: для обычных запросов — вместе с чтением тела, для стрима — до заголовков. */
   timeoutMs?: number;
+  /** Общий лимит вызова (Date.now()-время): повторы и ожидания не выходят за него. */
+  deadlineMs?: number;
+  /** Повторы — только в первые N мс вызова (чат: пока сервер держит замок ключа). */
+  retryWindowMs?: number;
   maxRetries?: number;
   retryStatuses?: ReadonlySet<number>;
   /**
@@ -653,8 +663,13 @@ export interface ClientOverrides {
   defaultHeaders?: Record<string, string>;
 }
 
-function runtimeEnv(): Record<string, string | undefined> {
-  return (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env ?? {};
+function envVar(name: string): string | undefined {
+  try {
+    const value = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env?.[name];
+    return value || undefined; // пустая переменная = не задана
+  } catch {
+    return undefined; // Deno без --allow-env и т.п.
+  }
 }
 
 function userAgent(): string {
@@ -688,8 +703,7 @@ export class NexusClient {
    * @param opts.baseUrl по умолчанию NEXUSAPI_BASE_URL или https://nexusapi.dev
    */
   constructor(opts: ClientOptions = {}) {
-    const env = runtimeEnv();
-    const apiKey = opts.apiKey ?? env[ENV_API_KEY];
+    const apiKey = opts.apiKey ?? envVar(ENV_API_KEY);
     if (!apiKey) {
       throw new AuthenticationError(`apiKey is required: pass { apiKey } or set the ${ENV_API_KEY} environment variable`);
     }
@@ -698,7 +712,7 @@ export class NexusClient {
     const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     validateTimeout("timeoutMs", timeoutMs);
     this.#apiKey = apiKey;
-    this.baseUrl = normalizeBaseUrl(opts.baseUrl ?? env[ENV_BASE_URL] ?? DEFAULT_BASE_URL);
+    this.baseUrl = normalizeBaseUrl(opts.baseUrl || envVar(ENV_BASE_URL) || DEFAULT_BASE_URL);
     this.timeoutMs = timeoutMs;
     this.maxRetries = maxRetries;
     this.defaultHeaders = { ...opts.defaultHeaders };
@@ -715,8 +729,10 @@ export class NexusClient {
 
   /**
    * Копия клиента с другими настройками:
-   * `client.withOptions({ timeoutMs: 10_000, maxRetries: 0 }).videos.create(...)`.
-   * Заголовки дополняют текущие.
+   * `client.withOptions({ maxRetries: 0, defaultHeaders: { "X-Trace": id } })`.
+   * Заголовки дополняют текущие. `timeoutMs` здесь — таймаут одной попытки;
+   * у POST /generate он не меньше 120 с, у чата и /v1/images — не меньше 600 с.
+   * Точный лимит на вызов — `{ timeoutMs }` вторым аргументом метода.
    */
   withOptions(overrides: ClientOverrides = {}): NexusClient {
     return new NexusClient({
@@ -769,13 +785,30 @@ export class NexusClient {
     validateMaxRetries(maxRetries);
     const retrySentErrors = opts.retrySentErrors ?? !stream;
     const url = `${this.baseUrl}${path}`;
-    const headers: Record<string, string> = { "User-Agent": userAgent(), ...this.defaultHeaders };
-    if (body !== undefined) headers["Content-Type"] = "application/json";
-    if (auth) headers.Authorization = `Bearer ${this.#apiKey}`;
-    if (extraHeaders) Object.assign(headers, extraHeaders);
-    const idempotencyKey = headers["Idempotency-Key"];
+    // Порядок важен и регистр не важен: заголовки пользователя не перебивают
+    // ключ API; Idempotency-Key ресурсы уже свели к одному значению.
+    const headers: Record<string, string> = {};
+    setHeader(headers, "User-Agent", userAgent());
+    for (const [name, value] of Object.entries(this.defaultHeaders)) setHeader(headers, name, value);
+    for (const [name, value] of Object.entries(extraHeaders ?? {})) setHeader(headers, name, value);
+    if (body !== undefined) setHeader(headers, "Content-Type", "application/json");
+    if (auth) setHeader(headers, "Authorization", `Bearer ${this.#apiKey}`);
+    // Недопустимое значение заголовка — ошибка в данных, а не сеть: бросаем до цикла.
+    new Headers(headers);
+    const idempotencyKey = getHeader(headers, "Idempotency-Key");
     // Сериализуем один раз и до цикла: ошибка в данных — не повод для повторов.
     const payload = body !== undefined ? JSON.stringify(body) : undefined;
+
+    const startedAt = Date.now();
+    const { deadlineMs } = opts;
+    const windowEnd = opts.retryWindowMs !== undefined ? startedAt + opts.retryWindowMs : undefined;
+    /** Можно ли ещё повторить через `delay` мс (окно повторов и общий лимит вызова). */
+    const allows = (delay: number): boolean => {
+      const now = Date.now();
+      if (windowEnd !== undefined && now >= windowEnd) return false;
+      if (deadlineMs !== undefined && now + delay >= deadlineMs) return false;
+      return true;
+    };
 
     let attempt = 0;
     let conflictAttempt = 0;
@@ -789,10 +822,12 @@ export class NexusClient {
       if (signal?.aborted) controller.abort(signal.reason);
       else signal?.addEventListener("abort", onUserAbort, { once: true });
       let timedOut = false;
+      const attemptTimeout =
+        deadlineMs !== undefined ? Math.max(1, Math.min(timeoutMs, deadlineMs - Date.now())) : timeoutMs;
       const timeoutHandle = setTimeout(() => {
         timedOut = true;
         controller.abort();
-      }, timeoutMs);
+      }, attemptTimeout);
 
       let resp: Response;
       let text = "";
@@ -811,20 +846,24 @@ export class NexusClient {
         // Отмена пользователем — не повторяем, пробрасываем как есть (AbortError).
         if (signal?.aborted) throw e;
         const notSent = isNotSentError(e);
-        if ((retrySentErrors || notSent) && attempt < maxRetries) {
-          await sleep(backoffDelayMs(attempt), signal);
+        const delay = backoffDelayMs(attempt);
+        if ((retrySentErrors || notSent) && attempt < maxRetries && allows(delay)) {
+          await sleep(delay, signal);
           attempt += 1;
           continue;
         }
-        throw networkError(e, { attempt, notSent, stream, timedOut, timeoutMs, idempotencyKey });
+        throw networkError(e, { attempt, notSent, stream, timedOut, timeoutMs: attemptTimeout, idempotencyKey });
       }
       clearTimeout(timeoutHandle);
       if (!stream || !resp.ok) cleanup();
 
       if (retryStatuses.has(resp.status) && attempt < maxRetries) {
-        await sleep(parseRetryAfterMs(resp.headers) ?? backoffDelayMs(attempt), signal);
-        attempt += 1;
-        continue;
+        const delay = parseRetryAfterMs(resp.headers) ?? backoffDelayMs(attempt);
+        if (allows(delay)) {
+          await sleep(delay, signal);
+          attempt += 1;
+          continue;
+        }
       }
 
       // 409 после повтора самого SDK: первый запрос с этим ключом ещё выполняется
@@ -832,8 +871,9 @@ export class NexusClient {
       if (resp.status === 409 && idempotencyKey && attempt > 0 && !stream) {
         const now = Date.now();
         conflictDeadline ??= now + CONFLICT_WAIT_BUDGET_MS;
-        if (now < conflictDeadline) {
-          await sleep(Math.min(backoffDelayMs(conflictAttempt), 5_000, conflictDeadline - now), signal);
+        const delay = Math.min(backoffDelayMs(conflictAttempt), 5_000, conflictDeadline - now);
+        if (now < conflictDeadline && allows(delay)) {
+          await sleep(delay, signal);
           conflictAttempt += 1;
           continue;
         }
@@ -861,7 +901,7 @@ export class NexusClient {
       );
       err.headers = headersToObject(response.headers);
       err.requestId = response.headers.get("x-request-id") ?? undefined;
-      err.idempotencyKey = opts.extraHeaders?.["Idempotency-Key"];
+      err.idempotencyKey = getHeader(opts.extraHeaders, "Idempotency-Key");
       throw err;
     }
   }
@@ -893,7 +933,7 @@ function networkError(
         `instead of starting a new one`;
     }
   }
-  const err = ctx.timedOut ? new APITimeoutError(message) : new NetworkError(message);
+  const err = ctx.timedOut || isTimeoutError(e) ? new APITimeoutError(message) : new NetworkError(message);
   err.idempotencyKey = ctx.idempotencyKey;
   (err as { cause?: unknown }).cause = e;
   return err;

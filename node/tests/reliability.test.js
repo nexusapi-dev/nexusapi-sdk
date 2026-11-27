@@ -79,7 +79,7 @@ describe("Retry-After", () => {
   });
 
   it("abort during a retry pause rejects right away", { timeout: 5_000 }, async () => {
-    const { fetchMock } = mockFetch(() => json(503, { error: { message: "busy" } }, { "retry-after": "30" }));
+    const { fetchMock } = mockFetch(() => json(502, { error: { message: "busy" } }, { "retry-after": "30" }));
     const ac = new AbortController();
     const started = Date.now();
     setTimeout(() => ac.abort(), 50);

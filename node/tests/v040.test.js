@@ -200,3 +200,88 @@ describe("webhooks", () => {
     await assert.rejects(c.webhooks.unwrap(BODY, signed(BODY, referenceSecret("other"))), WebhookVerificationError);
   });
 });
+
+// ============================================================
+// Исправления по ревью 0.4.0
+// ============================================================
+
+describe("review fixes", () => {
+  it("Idempotency-Key from per-call headers is used (any case); one Authorization", async () => {
+    const { fetchMock, calls } = mockFetch(() => json(202, { task_id: "t" }));
+    const c = client(fetchMock, { defaultHeaders: { authorization: "Bearer proxy-token", "user-agent": "custom/1" } });
+    await c.videos.create({ model: "m", prompt: "p" }, { headers: { "idempotency-key": "order-12345" } });
+    const headers = calls[0].headers;
+    const names = Object.keys(headers).map((k) => k.toLowerCase());
+    assert.equal(names.filter((n) => n === "authorization").length, 1);
+    assert.equal(names.filter((n) => n === "idempotency-key").length, 1);
+    assert.equal(headers.Authorization, "Bearer k-123");
+    assert.equal(headers["Idempotency-Key"], "order-12345");
+    const ua = Object.entries(headers).filter(([k]) => k.toLowerCase() === "user-agent");
+    assert.deepEqual(ua.map(([, v]) => v), ["custom/1"]); // свой User-Agent можно, но один
+  });
+
+  it("invalid header values fail fast, without retries", async () => {
+    const { fetchMock, calls } = mockFetch(() => json(200, TASK));
+    await assert.rejects(client(fetchMock, { maxRetries: 3, defaultHeaders: { "X-Team": "медиа" } }).tasks.get("t"), TypeError);
+    assert.equal(calls.length, 0);
+  });
+
+  it("empty NEXUSAPI_BASE_URL is ignored", async () => {
+    const saved = process.env.NEXUSAPI_BASE_URL;
+    process.env.NEXUSAPI_BASE_URL = "";
+    try {
+      const { fetchMock, calls } = mockFetch(() => json(200, TASK));
+      await new NexusClient({ apiKey: "k", fetch: fetchMock, maxRetries: 0 }).tasks.get("t");
+      assert.equal(calls[0].url, "https://nexusapi.dev/tasks/t");
+    } finally {
+      if (saved === undefined) delete process.env.NEXUSAPI_BASE_URL;
+      else process.env.NEXUSAPI_BASE_URL = saved;
+    }
+  });
+
+  it("explicit per-call timeoutMs bounds the whole call including retries", { timeout: 5_000 }, async () => {
+    const hanging = (url, init) =>
+      new Promise((_, reject) => init.signal.addEventListener("abort", () => reject(init.signal.reason ?? new Error("aborted"))));
+    let calls = 0;
+    const counting = (url, init) => {
+      calls += 1;
+      return hanging(url, init);
+    };
+    const started = Date.now();
+    await assert.rejects(
+      client(counting, { maxRetries: 5 }).chat.completions.create({ model: "m", messages: [] }, { timeoutMs: 150 }),
+      APITimeoutError,
+    );
+    assert.ok(Date.now() - started < 1_000);
+    assert.equal(calls, 1);
+  });
+
+  it("v1.images: 500 (failed task) is not retried", async () => {
+    const { fetchMock, calls } = mockFetch(() => json(500, { error: { message: "Task failed" } }, { "retry-after": "0" }));
+    await assert.rejects(client(fetchMock, { maxRetries: 3 }).v1.images.generate({ model: "m", prompt: "p" }), InternalServerError);
+    assert.equal(calls.length, 1);
+  });
+
+  it("undici header timeout maps to APITimeoutError", async () => {
+    const { fetchMock } = mockFetch(() => {
+      throw new TypeError("fetch failed", { cause: { code: "UND_ERR_HEADERS_TIMEOUT" } });
+    });
+    await assert.rejects(client(fetchMock).tasks.get("t"), APITimeoutError);
+  });
+
+  it("webhooks: parsed JSON payload and bad tolerance are rejected clearly", async () => {
+    const secret = referenceSecret("k-123");
+    await assert.rejects(unwrapWebhook(JSON.parse(BODY), signed(BODY, secret), secret), TypeError);
+    await assert.rejects(verifyWebhookSignature(BODY, signed(BODY, secret), secret, { toleranceSeconds: Number.NaN }), RangeError);
+  });
+
+  it("v1.videos.create does not send timeoutMs in the body", async () => {
+    const calls = [];
+    const fetchMock = async (url, init) => {
+      calls.push(JSON.parse(init.body));
+      return json(200, { id: "v", status: "queued" });
+    };
+    await client(fetchMock).v1.videos.create({ model: "m", prompt: "p", timeoutMs: 5_000 });
+    assert.equal("timeoutMs" in calls[0], false);
+  });
+});

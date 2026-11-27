@@ -141,14 +141,29 @@ const client = new NexusClient({
 });
 
 // Разовые настройки — копия клиента
-await client.withOptions({ timeoutMs: 10_000, maxRetries: 0 }).tasks.get(taskId);
+await client.withOptions({ maxRetries: 0, defaultHeaders: { "X-Trace": "abc" } }).tasks.get(taskId);
 
-// Или опции одного вызова — второй аргумент любого метода
+// Или опции одного вызова — второй аргумент методов ресурсов
+// (для task.wait / v1.videos.wait — { timeoutMs, pollIntervalMs, signal })
 await client.videos.create(
   { model: "veo-3-fast", prompt: "…", duration: 8 },
   { signal: controller.signal, timeoutMs: 120_000, maxRetries: 1, headers: { "X-Trace": "abc" } },
 );
 ```
+
+`timeoutMs` клиента — лимит одной попытки (вместе с чтением ответа); у
+`POST /generate` он не меньше 120 с, у чата и `v1.images` — не меньше 600 с.
+`timeoutMs` вызова — общий лимит на весь вызов вместе с повторами. Без него
+`v1.images.generate` при повторах 504 может ждать дольше 180 с (до ~9 минут);
+ограничьте его `timeoutMs` или `maxRetries`.
+
+Свой ключ идемпотентности можно передать в параметрах (`idempotencyKey`) или
+заголовком `Idempotency-Key` вызова — SDK использует его во всех повторах.
+
+> **ESM и CommonJS.** Пакет содержит обе сборки. Если в одном процессе его
+> загрузили и через `import`, и через `require`, это две копии классов:
+> `instanceof` ошибки одной копии против класса другой вернёт `false`. Держитесь
+> одного способа импорта или проверяйте `err.name`.
 
 ## Вебхуки и проверка подписи
 
@@ -201,18 +216,19 @@ const event = await unwrapWebhook(rawBody, request.headers, process.env.NEXUS_WE
   с тем же ключом — после 5xx, таймаута или обрыва — возвращает ту же задачу и
   не списывает деньги второй раз. Если повтор получил 409 «первый запрос ещё
   выполняется», SDK ждёт до 2 минут его ответ.
-- **Что делать после ошибки.** У каждой ошибки есть `idempotencyKey` и
-  `requestId`.
+- **Что делать после ошибки.** У ошибок POST-запросов есть `idempotencyKey`,
+  у ошибок с ответом сервера — `requestId`.
   - Генерации: повторяйте с тем же `idempotencyKey`, а не с новым — сервер
     вернёт ту же задачу. 504 у `v1.images.generate` несёт `taskId`: задачу можно
     дождаться через `(await client.tasks.get(err.taskId)).wait()`.
   - Чат: сервер хранит только успешный ответ — после 5xx повтор вызовет
-    модель снова (500 SDK поэтому сам не повторяет).
+    модель снова. Поэтому 500 и 503 SDK у чата сам не повторяет, а остальные
+    повторы делает только в первые 9 минут вызова, пока сервер держит замок
+    ключа.
   - Стрим чата повторить нельзя: сервер его не сохраняет.
   - В поддержку пишите с `requestId` — по нему находят запрос в логах.
-- **Таймауты** — `timeoutMs` покрывает весь запрос вместе с чтением ответа.
-  `POST /generate` ждёт не меньше 120 с (часть моделей до ответа проверяет
-  входные файлы), `chat.completions` и `v1.images.generate` — не меньше 600 с.
+- **Таймауты** — см. «Настройки клиента»: таймаут клиента — на попытку,
+  `timeoutMs` вызова — на весь вызов. Таймаут — `APITimeoutError`.
 - **Ожидание задач** — `task.wait()` и `client.v1.videos.wait()` пережидают
   временные ошибки опроса (сеть, 429, 5xx) и принимают
   `{ timeoutMs, pollIntervalMs, signal }`. Если время вышло, задача продолжает
@@ -221,9 +237,10 @@ const event = await unwrapWebhook(rawBody, request.headers, process.env.NEXUS_WE
 - **Ключ не утекает в логи** — `console.log(client)` и `JSON.stringify(task)`
   не показывают API-ключ.
 - **Лимит fetch в Node** — встроенный `fetch` ждёт заголовки ответа не дольше
-  300 с. Для генераций, которые могут идти дольше (например, Seedream Pro),
-  используйте нативный `client.images.generate` (опрос задачи) или стрим
-  чата; либо передайте свой `fetch` с undici `Agent({ headersTimeout: 0 })`.
+  300 с (`APITimeoutError`). Для генераций, которые могут идти дольше
+  (например, Seedream Pro), используйте нативный `client.images.generate`
+  (опрос задачи) или стрим чата; либо передайте свой `fetch` с undici
+  `Agent({ headersTimeout: 0 })`.
 - **Все native-параметры** — `webhook_url`, `negative_prompt`, `image_url`,
   `cfg_scale`, `video_urls` для seedance, `source_video_url` для veo-extend
   передаются прямо в `create()` / `generate()` как обычные поля объекта.

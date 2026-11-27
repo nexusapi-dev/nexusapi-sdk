@@ -128,7 +128,11 @@ function headerValue(headers: WebhookHeaders, name: string): string | undefined 
 function payloadBytes(payload: WebhookPayload): Uint8Array {
   if (typeof payload === "string") return encoder.encode(payload);
   if (payload instanceof Uint8Array) return payload;
-  return new Uint8Array(payload);
+  if (payload instanceof ArrayBuffer) return new Uint8Array(payload);
+  // Частая ошибка — передать уже разобранный JSON (req.body после express.json()).
+  throw new TypeError(
+    "Webhook payload must be the raw request body (string, Uint8Array/Buffer or ArrayBuffer), not parsed JSON",
+  );
 }
 
 /** Секрет подписи вебхуков для задач этого API-ключа (без запроса к API). */
@@ -162,6 +166,9 @@ export async function verifyWebhookSignature(
   }
   const timestamp = Number(timestampRaw.trim());
   const tolerance = options.toleranceSeconds ?? DEFAULT_WEBHOOK_TOLERANCE_SECONDS;
+  if (!Number.isFinite(tolerance) || tolerance < 0) {
+    throw new RangeError("toleranceSeconds must be a non-negative number (0 disables the check)");
+  }
   if (tolerance > 0) {
     const now = options.nowSeconds ?? Date.now() / 1000;
     if (Math.abs(now - timestamp) > tolerance) {

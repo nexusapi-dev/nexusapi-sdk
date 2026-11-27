@@ -152,7 +152,7 @@ describe("chat.completions.create", () => {
 
   it("uses the user idempotencyKey and keeps it across retries", async () => {
     const { fetchMock, calls } = mockFetch((_, n) =>
-      n === 1 ? json(503, { error: { message: "busy" } }, { "retry-after": "0" }) : json(200, COMPLETION),
+      n === 1 ? json(502, { error: { message: "busy" } }, { "retry-after": "0" }) : json(200, COMPLETION),
     );
     await client(fetchMock, { maxRetries: 2 }).chat.completions.create({
       model: "m",
@@ -164,9 +164,10 @@ describe("chat.completions.create", () => {
     assert.equal(calls[1].headers["Idempotency-Key"], "my-key-123");
   });
 
-  // Чат: 502/503/504 повторяем (прокси, сервер ещё работает), 500 — нет: он мог
-  // прийти после вызова модели, а чат сервер к ключу не привязывает.
-  for (const [status, expected] of [[500, 1], [502, 3], [503, 3], [504, 3]]) {
+  // Чат: 502/504 повторяем (прокси, сервер ещё работает). 500 — нет: он мог
+  // прийти после вызова модели. 503 — нет: повтор снова отправил бы запрос
+  // платному поставщику модели.
+  for (const [status, expected] of [[500, 1], [502, 3], [503, 1], [504, 3]]) {
     it(`chat: HTTP ${status} → ${expected} attempt(s), same key`, async () => {
       const { fetchMock, calls } = mockFetch(() => json(status, { error: { message: "x" } }, { "retry-after": "0" }));
       await assert.rejects(

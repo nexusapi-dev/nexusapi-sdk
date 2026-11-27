@@ -7,10 +7,14 @@ import type { NexusClient, RequestOptions, WaitOptions } from "./client.js";
 import { NexusError, TaskFailedError, TaskTimeoutError } from "./errors.js";
 import {
   CHAT_RETRY_STATUSES,
+  CHAT_RETRY_WINDOW_MS,
   compact,
-  generateIdempotencyKey,
+  deadlineFrom,
+  getHeader,
+  IMAGES_RETRY_STATUSES,
   isTransientError,
   requestTransport,
+  resolveIdempotencyKey,
   SAFE_RETRY_STATUSES,
   sleep,
   validateIdempotencyKey,
@@ -211,19 +215,23 @@ export class ChatCompletions {
   ): Promise<ChatCompletion | Stream<ChatCompletionChunk>> {
     const { stream, idempotencyKey, timeoutMs: paramsTimeout, signal: paramsSignal, ...rest } = params;
     const body = compact(rest);
-    const requestTimeout = this.client._longTimeoutMs(options.timeoutMs ?? paramsTimeout);
+    const explicitTimeout = options.timeoutMs ?? paramsTimeout;
+    const requestTimeout = this.client._longTimeoutMs(explicitTimeout);
+    const deadlineMs = deadlineFrom(explicitTimeout);
     const signal = options.signal ?? paramsSignal;
     if (stream) {
       body.stream = true;
       const extraHeaders: Record<string, string> = { ...options.headers, Accept: "text/event-stream" };
-      if (idempotencyKey) {
-        validateIdempotencyKey(idempotencyKey);
-        extraHeaders["Idempotency-Key"] = idempotencyKey;
+      const streamKey = idempotencyKey ?? getHeader(options.headers, "Idempotency-Key");
+      if (streamKey) {
+        validateIdempotencyKey(streamKey);
+        extraHeaders["Idempotency-Key"] = streamKey;
       }
       const { response, controller, cleanup } = await this.client._send("POST", "/v1/chat/completions", {
         body,
         extraHeaders,
         timeoutMs: requestTimeout,
+        deadlineMs,
         maxRetries: options.maxRetries,
         retryStatuses: SAFE_RETRY_STATUSES,
         signal,
@@ -233,8 +241,10 @@ export class ChatCompletions {
     }
     return this.client._request<ChatCompletion>("POST", "/v1/chat/completions", {
       body,
-      extraHeaders: { ...options.headers, "Idempotency-Key": generateIdempotencyKey(idempotencyKey) },
+      extraHeaders: { ...options.headers, "Idempotency-Key": resolveIdempotencyKey(idempotencyKey, options.headers) },
       timeoutMs: requestTimeout,
+      deadlineMs,
+      retryWindowMs: CHAT_RETRY_WINDOW_MS,
       maxRetries: options.maxRetries,
       retryStatuses: CHAT_RETRY_STATUSES,
       signal,
@@ -275,8 +285,10 @@ export class V1Images {
     const { idempotencyKey, timeoutMs, signal, ...rest } = params;
     return this.client._request<ImagesResponse>("POST", "/v1/images/generations", {
       body: compact(rest),
-      extraHeaders: { ...options.headers, "Idempotency-Key": generateIdempotencyKey(idempotencyKey) },
+      extraHeaders: { ...options.headers, "Idempotency-Key": resolveIdempotencyKey(idempotencyKey, options.headers) },
       timeoutMs: this.client._longTimeoutMs(options.timeoutMs ?? timeoutMs),
+      deadlineMs: deadlineFrom(options.timeoutMs ?? timeoutMs),
+      retryStatuses: IMAGES_RETRY_STATUSES,
       maxRetries: options.maxRetries,
       signal: options.signal ?? signal,
     });
@@ -294,11 +306,13 @@ export class V1Videos {
 
   /** POST /v1/videos — создаёт видео (Sora-style), сразу возвращает объект со status "queued". */
   async create(params: V1VideoCreateParams, options: RequestOptions = {}): Promise<VideoObject> {
-    const { idempotencyKey, signal, ...rest } = params;
+    const { idempotencyKey, signal, timeoutMs, ...rest } = params as V1VideoCreateParams & { timeoutMs?: number };
+    const explicitTimeout = options.timeoutMs ?? timeoutMs;
     return this.client._request<VideoObject>("POST", "/v1/videos", {
       body: compact(rest),
-      extraHeaders: { ...options.headers, "Idempotency-Key": generateIdempotencyKey(idempotencyKey) },
-      timeoutMs: options.timeoutMs ?? this.client._generateTimeoutMs(),
+      extraHeaders: { ...options.headers, "Idempotency-Key": resolveIdempotencyKey(idempotencyKey, options.headers) },
+      timeoutMs: explicitTimeout ?? this.client._generateTimeoutMs(),
+      deadlineMs: deadlineFrom(explicitTimeout),
       maxRetries: options.maxRetries,
       signal: options.signal ?? signal,
     });
