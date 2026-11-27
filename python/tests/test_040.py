@@ -282,3 +282,126 @@ def test_typed_responses_are_plain_dicts():
     models = _client(handler).v1.models.list()
     assert isinstance(models[0], dict) and models[0]["id"] == "m"
     assert hasattr(nexusapi.types, "ChatCompletion") and nexusapi.__version__ == "0.4.0"
+
+
+# ============================================================
+# Исправления по ревью 0.4.0
+# ============================================================
+
+
+def test_empty_api_key_is_not_replaced_by_env(monkeypatch):
+    monkeypatch.setenv("NEXUSAPI_API_KEY", "operator-key")
+    with pytest.raises(AuthenticationError):
+        NexusClient(api_key="")
+    assert NexusClient(api_key=None)._api_key == "operator-key"
+
+
+def test_headers_are_case_insensitive_and_sdk_wins():
+    seen: list[list[tuple[str, str]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(list(request.headers.multi_items()))
+        return httpx.Response(202, json={"task_id": "t"})
+
+    client = _client(handler, default_headers={
+        "authorization": "Bearer other", "user-agent": "custom/1", "idempotency-key": "static-key-1",
+    })
+    client.videos.create(model="m", prompt="p")
+    names = [k.lower() for k, _ in seen[0]]
+    assert names.count("authorization") == 1 and names.count("idempotency-key") == 1
+    headers = dict(seen[0])
+    assert headers["authorization"] == "Bearer k-123"
+    assert headers["idempotency-key"].startswith("sdk-")
+    assert headers["user-agent"] == "custom/1"  # свой User-Agent можно
+
+
+def test_explicit_timeout_bounds_the_whole_call(monkeypatch):
+    import nexusapi.client as cm
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(cm.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(cm.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        clock["t"] += 30  # каждая попытка «длится» до таймаута
+        raise httpx.ReadTimeout("slow")
+
+    with pytest.raises(APITimeoutError):
+        _client(handler, max_retries=5).chat.completions.create(model="m", messages=[], timeout=30)
+    assert calls["n"] == 1  # после 30 с времени на повтор нет
+
+
+def test_chat_retries_stop_after_lock_window(monkeypatch):
+    import nexusapi.client as cm
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(cm.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(cm.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        clock["t"] += 600  # nginx отдал 504 через 600 с
+        return httpx.Response(504, json={"error": {"message": "gateway timeout"}})
+
+    with pytest.raises(InternalServerError):
+        _client(handler, max_retries=3).chat.completions.create(model="m", messages=[])
+    assert calls["n"] == 1  # после 540 с повтор мог бы запустить модель второй раз
+
+
+def test_images_do_not_retry_failed_task_500(no_sleep):
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(500, json={"error": {"message": "Task failed"}})
+
+    with pytest.raises(InternalServerError):
+        _client(handler, max_retries=3).v1.images.generate(model="m", prompt="p")
+    assert calls["n"] == 1
+
+
+@pytest.fixture
+def no_sleep(monkeypatch):
+    import nexusapi.client as cm
+
+    monkeypatch.setattr(cm.time, "sleep", lambda _: None)
+
+
+def test_non_ascii_signature_is_rejected_cleanly():
+    secret = _reference_secret("k-123")
+    headers = _signed(BODY, secret)
+    headers["X-Nexus-Signature"] = "v1=\xe9\xe9"
+    with pytest.raises(WebhookVerificationError):
+        webhooks.verify_signature(BODY, headers, secret)
+
+
+def test_copy_keeps_client_pickle_drops_it():
+    import copy as copy_module
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"task_id": "t", "status": "completed", "result": {"x": [1]}})
+
+    task = _client(handler).tasks.get("t")
+    shallow = copy_module.copy(task)
+    deep = copy_module.deepcopy(task)
+    assert shallow.refresh().id == "t" and deep.refresh().id == "t"
+    assert deep.result is not task.result
+    assert pickle.loads(pickle.dumps(task))._client is None
+
+
+def test_stream_timeout_is_api_timeout_error():
+    class Slow(httpx.SyncByteStream):
+        def __iter__(self):
+            yield b'data: {"choices": []}\n\n'
+            raise httpx.ReadTimeout("idle")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=Slow())
+
+    stream = _client(handler).chat.completions.create(model="m", messages=[], stream=True)
+    next(stream)
+    with pytest.raises(APITimeoutError):
+        next(stream)

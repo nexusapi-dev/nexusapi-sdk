@@ -31,6 +31,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import time
 from typing import Any, Mapping, Optional, Union, cast
 
@@ -111,6 +112,8 @@ def verify_signature(
         timestamp = int(timestamp_raw.strip())
     except ValueError as e:
         raise WebhookVerificationError(f"Invalid {TIMESTAMP_HEADER} header") from e
+    if math.isnan(tolerance):
+        raise ValueError("tolerance must be a number of seconds")
     if tolerance > 0:
         current = time.time() if now is None else now
         if abs(current - timestamp) > tolerance:
@@ -121,7 +124,9 @@ def verify_signature(
     expected = hmac.new(secret.encode("utf-8"), signed, hashlib.sha256).hexdigest()
     for part in signature_raw.split(","):
         version, _, value = part.strip().partition("=")
-        if version == SIGNATURE_VERSION and hmac.compare_digest(value.strip(), expected):
+        value = value.strip()
+        # compare_digest на str принимает только ASCII; чужие символы — просто не та подпись.
+        if version == SIGNATURE_VERSION and value.isascii() and hmac.compare_digest(value, expected):
             return
     raise WebhookVerificationError("Webhook signature does not match")
 

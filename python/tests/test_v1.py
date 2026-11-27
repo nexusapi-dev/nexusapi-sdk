@@ -132,8 +132,9 @@ def test_chat_per_call_timeout_and_user_idempotency_key():
         model="m", messages=[], idempotency_key="my-key-123", timeout=30,
     )
     assert captured["idem"] == "my-key-123"
-    assert captured["timeout"]["read"] == 30
-    assert captured["timeout"]["connect"] == 30
+    # Явный timeout — общий лимит вызова: попытка получает остаток (≤ 30 с).
+    assert 29 < captured["timeout"]["read"] <= 30
+    assert 29 < captured["timeout"]["connect"] <= 30
 
 
 def test_chat_client_timeout_above_default_is_kept():
@@ -161,9 +162,10 @@ def test_chat_openai_error_shape():
 
 
 def test_chat_retry_policy(no_sleep):
-    """Чат: 502/503/504 повторяем (прокси, сервер ещё работает), 500 — нет:
-    он мог прийти после вызова модели, а чат сервер к ключу не привязывает."""
-    for status, expected_calls in ((503, 3), (502, 3), (504, 3), (500, 1)):
+    """Чат: 502/504 повторяем (прокси, сервер ещё работает). 500 — нет: он мог
+    прийти после вызова модели. 503 — нет: повтор снова отправил бы запрос
+    платному поставщику модели."""
+    for status, expected_calls in ((502, 3), (504, 3), (503, 1), (500, 1)):
         calls = {"n": 0}
         keys: set[str] = set()
 

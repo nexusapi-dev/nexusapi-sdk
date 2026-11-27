@@ -7,7 +7,7 @@
 """
 from __future__ import annotations
 
-from typing import Any, List, Literal, Optional, TypedDict
+from typing import Any, Dict, List, Literal, Optional, TypedDict
 
 # ============================================================
 # Чат: POST /v1/chat/completions
@@ -31,6 +31,8 @@ class CompletionUsage(TypedDict, total=False):
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+    prompt_tokens_details: Dict[str, Any]
+    completion_tokens_details: Dict[str, Any]
 
 
 class ChatCompletion(TypedDict, total=False):
@@ -40,6 +42,7 @@ class ChatCompletion(TypedDict, total=False):
     model: str
     choices: List[ChatCompletionChoice]
     usage: CompletionUsage
+    system_fingerprint: Optional[str]
 
 
 class ChatCompletionChunkDelta(TypedDict, total=False):
@@ -78,6 +81,8 @@ class OpenAIModel(TypedDict, total=False):
 
 class ImageData(TypedDict, total=False):
     url: str
+    revised_prompt: str
+    b64_json: str
 
 
 class ImagesResponse(TypedDict, total=False):
@@ -120,6 +125,13 @@ class PricingOption(TypedDict, total=False):
     resolution: str
     duration: int
     mode: str
+    hasVideoReference: bool
+    referenceRequired: bool
+    billingBasis: str
+    minimumOutputMultiplier: float
+    extendModel: str
+    sourceResolution: str
+    includedInputImages: int
 
 
 class ModelInfo(TypedDict, total=False):
@@ -136,6 +148,8 @@ class ModelInfo(TypedDict, total=False):
     cacheCreationPriceRubPerMTokens: float
     supportsVision: bool
     defaultPricingOptionId: str
+    billingBasis: str
+    longContextPricing: Dict[str, Any]
 
 
 # ============================================================

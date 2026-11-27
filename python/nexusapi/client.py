@@ -47,6 +47,7 @@ Async пример:
 from __future__ import annotations
 
 import asyncio
+import copy
 import email.utils
 import json as _json
 import logging
@@ -132,7 +133,19 @@ _RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
 # прийти после вызова модели — его не повторяем. 502/504 приходят от прокси,
 # пока сервер ещё работает: повтор с тем же ключом получит 409 (SDK подождёт)
 # или сохранённый ответ.
-_CHAT_RETRY_STATUSES = frozenset({429, 502, 503, 504})
+_CHAT_RETRY_STATUSES = frozenset({429, 502, 504})
+# 503 у чата сервер отдаёт и после неудачного вызова поставщика модели (в т.ч.
+# по таймауту): ответ не сохраняется, и повтор снова платно отправил бы запрос
+# поставщику. Поэтому 503 у чата не повторяем.
+#
+# Замок Idempotency-Key на сервере живёт 600 с: после этого повтор чата мог бы
+# запустить модель второй раз, пока первый запрос ещё идёт. Повторы и ожидание
+# 409 для чата — только в первые 540 с вызова.
+_CHAT_RETRY_WINDOW = 540.0
+
+# У /v1/images 500 означает, что задача завершилась ошибкой: повтор с тем же
+# ключом вернёт ту же упавшую задачу. Остальные 5xx повторяем.
+_IMAGES_RETRY_STATUSES = frozenset({429, 502, 503, 504})
 
 # SSE-стрим сервер не сохраняет вовсе: повторяем только ответы, пришедшие до
 # начала генерации.
@@ -275,6 +288,71 @@ def _parse_retry_after(headers: Mapping[str, str]) -> Optional[float]:
     return value
 
 
+class _RetryBudget:
+    """Когда ещё можно повторить: число попыток, общий дедлайн вызова (явный
+    timeout метода) и окно повторов (чат)."""
+
+    def __init__(
+        self, max_retries: int, deadline: Optional[float], retry_window: Optional[float],
+    ) -> None:
+        self.max_retries = max_retries
+        self.deadline = deadline
+        self.window_end = time.monotonic() + retry_window if retry_window is not None else None
+        self.attempt = 0
+        self.conflict_attempt = 0
+        self.conflict_deadline: Optional[float] = None
+
+    def allows(self, delay: float) -> bool:
+        now = time.monotonic()
+        if self.window_end is not None and now >= self.window_end:
+            return False
+        if self.deadline is not None and now + delay >= self.deadline:
+            return False
+        return True
+
+    def can_retry(self, delay: float) -> bool:
+        return self.attempt < self.max_retries and self.allows(delay)
+
+    def attempt_timeout(self, timeout: Any) -> Any:
+        """Таймаут попытки, урезанный до остатка общего дедлайна."""
+        if self.deadline is None:
+            return timeout
+        remaining = max(0.001, self.deadline - time.monotonic())
+        if isinstance(timeout, httpx.Timeout):
+            return httpx.Timeout(
+                connect=_min_opt(timeout.connect, remaining),
+                read=_min_opt(timeout.read, remaining),
+                write=_min_opt(timeout.write, remaining),
+                pool=_min_opt(timeout.pool, remaining),
+            )
+        return remaining if timeout is None else min(float(timeout), remaining)
+
+
+def _min_opt(value: Optional[float], cap: float) -> float:
+    return cap if value is None else min(value, cap)
+
+
+def _deadline(timeout: Optional[float]) -> Optional[float]:
+    return time.monotonic() + timeout if timeout is not None else None
+
+
+def _set_header(headers: dict[str, str], name: str, value: str) -> None:
+    """Ставит заголовок без учёта регистра: `authorization` и `Authorization` —
+    один заголовок, иначе httpx отправил бы оба."""
+    lower = name.lower()
+    for key in [k for k in headers if k.lower() == lower]:
+        del headers[key]
+    headers[name] = value
+
+
+def _get_header(headers: Mapping[str, str], name: str) -> Optional[str]:
+    lower = name.lower()
+    for key, value in headers.items():
+        if key.lower() == lower:
+            return value
+    return None
+
+
 def _retry_delay(resp: httpx.Response, attempt: int) -> float:
     """Задержка перед повтором: Retry-After, если он разумный, иначе backoff."""
     retry_after = _parse_retry_after(resp.headers)
@@ -396,7 +474,8 @@ class Stream:
                         return
                     yield event
             except httpx.TransportError as e:
-                raise errors.NetworkError(f"Stream interrupted: {e}") from e
+                cls = errors.APITimeoutError if isinstance(e, httpx.TimeoutException) else errors.NetworkError
+                raise cls(f"Stream interrupted: {e}") from e
         finally:
             self.response.close()
 
@@ -439,7 +518,8 @@ class AsyncStream:
                         return
                     yield event
             except httpx.TransportError as e:
-                raise errors.NetworkError(f"Stream interrupted: {e}") from e
+                cls = errors.APITimeoutError if isinstance(e, httpx.TimeoutException) else errors.NetworkError
+                raise cls(f"Stream interrupted: {e}") from e
         finally:
             await self.response.aclose()
 
@@ -477,6 +557,19 @@ class _TaskBase:
     @property
     def is_done(self) -> bool:
         return self.status in ("completed", "failed")
+
+    def __copy__(self) -> Any:
+        clone = self.__class__.__new__(self.__class__)
+        clone.__dict__.update(self.__dict__)
+        return clone
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> Any:
+        clone = self.__class__.__new__(self.__class__)
+        memo[id(self)] = clone
+        for key, value in self.__dict__.items():
+            # Клиент (пул соединений) не копируем — копия задачи работает через тот же.
+            clone.__dict__[key] = value if key == "_client" else copy.deepcopy(value, memo)
+        return clone
 
     def __getstate__(self) -> dict[str, Any]:
         # Без клиента: в нём HTTP-пул и ключ API. После unpickle задачу можно
@@ -941,6 +1034,7 @@ class ChatCompletions(_Resource):
         """
         body = _build_body({"model": model, "messages": messages}, extras)
         read_timeout = self._client._long_timeout(timeout)
+        deadline = _deadline(timeout)
         if stream:
             body["stream"] = True
             headers = {"Accept": "text/event-stream"}
@@ -950,12 +1044,14 @@ class ChatCompletions(_Resource):
             resp = self._client._send(
                 "POST", "/v1/chat/completions", json=body, extra_headers=headers,
                 timeout=read_timeout, retry_statuses=_SAFE_RETRY_STATUSES, stream=True,
+                deadline=deadline,
             )
             return Stream(resp)
         headers = {"Idempotency-Key": _generate_idempotency_key(idempotency_key)}
         return cast(Union[ChatCompletion, Stream], self._client._request(
             "POST", "/v1/chat/completions", json=body, extra_headers=headers,
             timeout=read_timeout, retry_statuses=_CHAT_RETRY_STATUSES,
+            deadline=deadline, retry_window=_CHAT_RETRY_WINDOW,
         ))
 
 
@@ -1002,6 +1098,7 @@ class V1Images(_Resource):
         return cast(ImagesResponse, self._client._request(
             "POST", "/v1/images/generations", json=body, extra_headers=headers,
             timeout=self._client._long_timeout(timeout),
+            retry_statuses=_IMAGES_RETRY_STATUSES, deadline=_deadline(timeout),
         ))
 
 
@@ -1270,6 +1367,7 @@ class AsyncChatCompletions(_AsyncResource):
     ) -> Union[ChatCompletion, AsyncStream]:
         body = _build_body({"model": model, "messages": messages}, extras)
         read_timeout = self._client._long_timeout(timeout)
+        deadline = _deadline(timeout)
         if stream:
             body["stream"] = True
             headers = {"Accept": "text/event-stream"}
@@ -1279,12 +1377,14 @@ class AsyncChatCompletions(_AsyncResource):
             resp = await self._client._send(
                 "POST", "/v1/chat/completions", json=body, extra_headers=headers,
                 timeout=read_timeout, retry_statuses=_SAFE_RETRY_STATUSES, stream=True,
+                deadline=deadline,
             )
             return AsyncStream(resp)
         headers = {"Idempotency-Key": _generate_idempotency_key(idempotency_key)}
         return cast(Union[ChatCompletion, AsyncStream], await self._client._request(
             "POST", "/v1/chat/completions", json=body, extra_headers=headers,
             timeout=read_timeout, retry_statuses=_CHAT_RETRY_STATUSES,
+            deadline=deadline, retry_window=_CHAT_RETRY_WINDOW,
         ))
 
 
@@ -1320,6 +1420,7 @@ class AsyncV1Images(_AsyncResource):
         return cast(ImagesResponse, await self._client._request(
             "POST", "/v1/images/generations", json=body, extra_headers=headers,
             timeout=self._client._long_timeout(timeout),
+            retry_statuses=_IMAGES_RETRY_STATUSES, deadline=_deadline(timeout),
         ))
 
 
@@ -1444,7 +1545,8 @@ class _ClientBase:
         max_retries: int,
         default_headers: Optional[Mapping[str, str]],
     ) -> None:
-        api_key = api_key or os.environ.get(ENV_API_KEY)
+        if api_key is None:
+            api_key = os.environ.get(ENV_API_KEY) or None
         if not api_key:
             raise errors.AuthenticationError(
                 f"api_key is required: pass api_key=... or set the {ENV_API_KEY} environment variable"
@@ -1462,16 +1564,23 @@ class _ClientBase:
     def _merged_headers(
         self, default_headers: Union[Mapping[str, str], NotGiven],
     ) -> dict[str, str]:
-        if isinstance(default_headers, NotGiven):
-            return dict(self._default_headers)
-        return {**self._default_headers, **default_headers}
+        merged = dict(self._default_headers)
+        if not isinstance(default_headers, NotGiven):
+            for name, value in default_headers.items():
+                _set_header(merged, name, value)
+        return merged
 
     def _headers(self, auth: bool, extra_headers: Optional[Mapping[str, str]]) -> dict[str, str]:
-        headers = {"User-Agent": _USER_AGENT, **self._default_headers}
+        # Порядок важен: заголовки пользователя не перебивают ключ API и
+        # Idempotency-Key запроса.
+        headers: dict[str, str] = {}
+        _set_header(headers, "User-Agent", _USER_AGENT)
+        for name, value in self._default_headers.items():
+            _set_header(headers, name, value)
         if auth:
-            headers["Authorization"] = f"Bearer {self._api_key}"
-        if extra_headers:
-            headers.update(extra_headers)
+            _set_header(headers, "Authorization", f"Bearer {self._api_key}")
+        for name, value in (extra_headers or {}).items():
+            _set_header(headers, name, value)
         return headers
 
     def __repr__(self) -> str:
@@ -1561,6 +1670,8 @@ class NexusClient(_ClientBase):
         retry_statuses: frozenset[int] = _RETRYABLE_STATUSES,
         stream: bool = False,
         retry_sent_errors: Optional[bool] = None,
+        deadline: Optional[float] = None,
+        retry_window: Optional[float] = None,
     ) -> httpx.Response:
         """Отправляет запрос с повторами; возвращает успешный httpx.Response.
 
@@ -1571,49 +1682,48 @@ class NexusClient(_ClientBase):
         """
         url = f"{self._base_url}{path}"
         headers = self._headers(auth, extra_headers)
-        idem_key = headers.get("Idempotency-Key")
+        idem_key = _get_header(headers, "Idempotency-Key")
         if retry_sent_errors is None:
             retry_sent_errors = not stream
 
-        attempt = 0
-        conflict_attempt = 0
-        conflict_deadline: Optional[float] = None
+        budget = _RetryBudget(self._max_retries, deadline, retry_window)
         while True:
             request = self._http.build_request(
                 method, url, json=json, params=params, headers=headers,
-                timeout=timeout if timeout is not None else self._timeout,
+                timeout=budget.attempt_timeout(timeout if timeout is not None else self._timeout),
             )
             try:
                 resp = self._http.send(request, stream=stream)
             except httpx.TransportError as e:
-                if _retryable_transport_error(e, retry_sent_errors) and attempt < self._max_retries:
-                    delay = _backoff_delay(attempt)
-                    _log_retry(method, path, attempt, self._max_retries, delay, type(e).__name__)
+                delay = _backoff_delay(budget.attempt)
+                if _retryable_transport_error(e, retry_sent_errors) and budget.can_retry(delay):
+                    _log_retry(method, path, budget.attempt, self._max_retries, delay, type(e).__name__)
                     time.sleep(delay)
-                    attempt += 1
+                    budget.attempt += 1
                     continue
-                raise _network_error(e, attempt, idem_key, stream) from e
+                raise _network_error(e, budget.attempt, idem_key, stream) from e
 
-            if resp.status_code in retry_statuses and attempt < self._max_retries:
-                delay = _retry_delay(resp, attempt)
-                resp.close()
-                _log_retry(method, path, attempt, self._max_retries, delay, f"HTTP {resp.status_code}")
-                time.sleep(delay)
-                attempt += 1
-                continue
+            if resp.status_code in retry_statuses:
+                delay = _retry_delay(resp, budget.attempt)
+                if budget.can_retry(delay):
+                    resp.close()
+                    _log_retry(method, path, budget.attempt, self._max_retries, delay, f"HTTP {resp.status_code}")
+                    time.sleep(delay)
+                    budget.attempt += 1
+                    continue
 
             # 409 после повтора самого SDK: первый запрос с этим ключом ещё
             # выполняется на сервере. Ждём его сохранённый ответ, а не сдаёмся.
-            if resp.status_code == 409 and idem_key and attempt > 0 and not stream:
+            if resp.status_code == 409 and idem_key and budget.attempt > 0 and not stream:
                 now = time.monotonic()
-                if conflict_deadline is None:
-                    conflict_deadline = now + _CONFLICT_WAIT_BUDGET
-                if now < conflict_deadline:
-                    delay = min(_backoff_delay(conflict_attempt), 5.0, conflict_deadline - now)
+                if budget.conflict_deadline is None:
+                    budget.conflict_deadline = now + _CONFLICT_WAIT_BUDGET
+                delay = min(_backoff_delay(budget.conflict_attempt), 5.0, budget.conflict_deadline - now)
+                if now < budget.conflict_deadline and budget.allows(delay):
                     resp.close()
-                    _log_retry(method, path, attempt, self._max_retries, delay, "HTTP 409 (in progress)")
+                    _log_retry(method, path, budget.attempt, self._max_retries, delay, "HTTP 409 (in progress)")
                     time.sleep(delay)
-                    conflict_attempt += 1
+                    budget.conflict_attempt += 1
                     continue
 
             if not resp.is_success:
@@ -1641,13 +1751,16 @@ class NexusClient(_ClientBase):
         timeout: Any = None,
         retry_statuses: frozenset[int] = _RETRYABLE_STATUSES,
         retry_sent_errors: bool = True,
+        deadline: Optional[float] = None,
+        retry_window: Optional[float] = None,
     ) -> Any:
         resp = self._send(
             method, path, json=json, params=params, auth=auth,
             extra_headers=extra_headers, timeout=timeout,
             retry_statuses=retry_statuses, retry_sent_errors=retry_sent_errors,
+            deadline=deadline, retry_window=retry_window,
         )
-        return _decode_json(resp, (extra_headers or {}).get("Idempotency-Key"))
+        return _decode_json(resp, _get_header(extra_headers or {}, "Idempotency-Key"))
 
     def close(self) -> None:
         """Закрывает пул соединений (если его создал SDK, а не передали снаружи)."""
@@ -1735,53 +1848,53 @@ class AsyncNexusClient(_ClientBase):
         retry_statuses: frozenset[int] = _RETRYABLE_STATUSES,
         stream: bool = False,
         retry_sent_errors: Optional[bool] = None,
+        deadline: Optional[float] = None,
+        retry_window: Optional[float] = None,
     ) -> httpx.Response:
         url = f"{self._base_url}{path}"
         headers = self._headers(auth, extra_headers)
-        idem_key = headers.get("Idempotency-Key")
+        idem_key = _get_header(headers, "Idempotency-Key")
         if retry_sent_errors is None:
             retry_sent_errors = not stream
 
-        loop = asyncio.get_running_loop()
-        attempt = 0
-        conflict_attempt = 0
-        conflict_deadline: Optional[float] = None
+        budget = _RetryBudget(self._max_retries, deadline, retry_window)
         while True:
             request = self._http.build_request(
                 method, url, json=json, params=params, headers=headers,
-                timeout=timeout if timeout is not None else self._timeout,
+                timeout=budget.attempt_timeout(timeout if timeout is not None else self._timeout),
             )
             try:
                 resp = await self._http.send(request, stream=stream)
             except httpx.TransportError as e:
-                if _retryable_transport_error(e, retry_sent_errors) and attempt < self._max_retries:
-                    delay = _backoff_delay(attempt)
-                    _log_retry(method, path, attempt, self._max_retries, delay, type(e).__name__)
+                delay = _backoff_delay(budget.attempt)
+                if _retryable_transport_error(e, retry_sent_errors) and budget.can_retry(delay):
+                    _log_retry(method, path, budget.attempt, self._max_retries, delay, type(e).__name__)
                     await asyncio.sleep(delay)
-                    attempt += 1
+                    budget.attempt += 1
                     continue
-                raise _network_error(e, attempt, idem_key, stream) from e
+                raise _network_error(e, budget.attempt, idem_key, stream) from e
 
-            if resp.status_code in retry_statuses and attempt < self._max_retries:
-                delay = _retry_delay(resp, attempt)
-                await resp.aclose()
-                _log_retry(method, path, attempt, self._max_retries, delay, f"HTTP {resp.status_code}")
-                await asyncio.sleep(delay)
-                attempt += 1
-                continue
+            if resp.status_code in retry_statuses:
+                delay = _retry_delay(resp, budget.attempt)
+                if budget.can_retry(delay):
+                    await resp.aclose()
+                    _log_retry(method, path, budget.attempt, self._max_retries, delay, f"HTTP {resp.status_code}")
+                    await asyncio.sleep(delay)
+                    budget.attempt += 1
+                    continue
 
             # 409 после повтора самого SDK: первый запрос с этим ключом ещё
             # выполняется на сервере. Ждём его сохранённый ответ, а не сдаёмся.
-            if resp.status_code == 409 and idem_key and attempt > 0 and not stream:
-                now = loop.time()
-                if conflict_deadline is None:
-                    conflict_deadline = now + _CONFLICT_WAIT_BUDGET
-                if now < conflict_deadline:
-                    delay = min(_backoff_delay(conflict_attempt), 5.0, conflict_deadline - now)
+            if resp.status_code == 409 and idem_key and budget.attempt > 0 and not stream:
+                now = time.monotonic()
+                if budget.conflict_deadline is None:
+                    budget.conflict_deadline = now + _CONFLICT_WAIT_BUDGET
+                delay = min(_backoff_delay(budget.conflict_attempt), 5.0, budget.conflict_deadline - now)
+                if now < budget.conflict_deadline and budget.allows(delay):
                     await resp.aclose()
-                    _log_retry(method, path, attempt, self._max_retries, delay, "HTTP 409 (in progress)")
+                    _log_retry(method, path, budget.attempt, self._max_retries, delay, "HTTP 409 (in progress)")
                     await asyncio.sleep(delay)
-                    conflict_attempt += 1
+                    budget.conflict_attempt += 1
                     continue
 
             if not resp.is_success:
@@ -1809,13 +1922,16 @@ class AsyncNexusClient(_ClientBase):
         timeout: Any = None,
         retry_statuses: frozenset[int] = _RETRYABLE_STATUSES,
         retry_sent_errors: bool = True,
+        deadline: Optional[float] = None,
+        retry_window: Optional[float] = None,
     ) -> Any:
         resp = await self._send(
             method, path, json=json, params=params, auth=auth,
             extra_headers=extra_headers, timeout=timeout,
             retry_statuses=retry_statuses, retry_sent_errors=retry_sent_errors,
+            deadline=deadline, retry_window=retry_window,
         )
-        return _decode_json(resp, (extra_headers or {}).get("Idempotency-Key"))
+        return _decode_json(resp, _get_header(extra_headers or {}, "Idempotency-Key"))
 
     async def close(self) -> None:
         if self._owns_http:
