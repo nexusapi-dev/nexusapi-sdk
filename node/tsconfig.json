@@ -12,9 +12,20 @@
     "esModuleInterop": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
-    "lib": ["ES2022"],
-    "types": ["node"]
+    "lib": [
+      "ES2022"
+    ],
+    "types": [
+      "node"
+    ],
+    "inlineSources": true,
+    "stripInternal": true
   },
-  "include": ["src/**/*"],
-  "exclude": ["dist", "node_modules"]
+  "include": [
+    "src/**/*"
+  ],
+  "exclude": [
+    "dist",
+    "node_modules"
+  ]
 }

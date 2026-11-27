@@ -1,8 +1,11 @@
 # NexusAPI SDKs
 
-Официальные клиентские библиотеки [NexusAPI](https://nexusapi.dev) — единого API
+Официальные клиентские библиотеки [NexusAPI](https://docs.nexusapi.dev) — единого API
 для генерации видео и изображений (Veo, Kling, Seedance, Nano-Banana и др.) и
 текстовых моделей (Claude, GPT).
+
+[![CI](https://github.com/nexusapi-dev/nexusapi-sdk/actions/workflows/ci.yml/badge.svg)](https://github.com/nexusapi-dev/nexusapi-sdk/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 | Язык | Пакет | Каталог | Установка |
 |---|---|---|---|
@@ -62,6 +65,17 @@ cd node && npm ci && npm test
 
 Тесты не ходят в сеть — HTTP подменяется моками. Выпуск версий описан в
 [RELEASING.md](RELEASING.md), уязвимости — [SECURITY.md](SECURITY.md).
+
+## Поддерживаемые версии
+
+| | Поддерживается | Тестируется в CI |
+|---|---|---|
+| Python | 3.9+ | 3.9–3.14 |
+| Node.js | 18+ | 18, 20, 22, 24, 26 |
+
+Python 3.9, Node 18 и Node 20 уже без поддержки от своих сообществ; их
+планируем убрать в 0.4.0. Исправления безопасности выходят для последней
+минорной версии.
 
 ## Лицензия
 

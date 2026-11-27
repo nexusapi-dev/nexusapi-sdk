@@ -47,25 +47,28 @@ Async пример:
 from __future__ import annotations
 
 import asyncio
+import email.utils
 import json as _json
 import logging
+import math
 import random
 import re
 import time
 import uuid
+import warnings
 from dataclasses import dataclass, field
 from typing import (
     Any,
     AsyncIterator,
-    Iterable,
     Iterator,
     Literal,
+    Mapping,
     Optional,
     Type,
     Union,
     overload,
 )
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import httpx
 
@@ -80,13 +83,24 @@ DEFAULT_MAX_RETRIES = 2
 DEFAULT_VIDEO_POLL_INTERVAL = 3.0
 DEFAULT_IMAGE_POLL_INTERVAL = 1.5
 DEFAULT_VIDEO_WAIT_TIMEOUT = 600.0  # 10 min
-DEFAULT_IMAGE_WAIT_TIMEOUT = 180.0  # 3 min
+# Картинки обычно готовы за 10-60 с, но Seedream Pro идёт до 540 с.
+DEFAULT_IMAGE_WAIT_TIMEOUT = 600.0  # 10 min
 
 # Синхронные /v1-запросы (чат, /v1/images/generations) сервер держит долго:
 # картинки до 180 с (Seedream Pro до 540 с), ответ LLM — минуты. Таймаут
 # чтения для них — не меньше 600 с (лимит прокси API), подключение — по
 # обычному таймауту клиента.
 DEFAULT_LONG_REQUEST_TIMEOUT = 600.0
+
+# POST /generate у части моделей до ответа проверяет входные файлы (до 90 с).
+DEFAULT_GENERATE_TIMEOUT = 120.0
+
+# Больше Retry-After не ждём: вместо часового сна — backoff.
+_MAX_RETRY_AFTER = 60.0
+# Сколько ждать, пока сервер закончит первый запрос, если повтор самого SDK
+# получил 409 «ещё выполняется».
+_CONFLICT_WAIT_BUDGET = 120.0
+_MAX_ERROR_MESSAGE = 500
 
 logger = logging.getLogger("nexusapi")
 
@@ -104,10 +118,6 @@ _SAFE_RETRY_STATUSES = frozenset({429, 503})
 # повторяем для SSE-стрима: стрим нельзя переотправить с середины.
 _NOT_SENT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
 
-# Http-методы которые ВСЕГДА можно безопасно retry'ить (идемпотентны).
-# POST в принципе не safe, но мы автоматически проставляем Idempotency-Key
-# на /generate — так что и POST тоже безопасен.
-_IDEMPOTENT_METHODS = frozenset({"GET", "DELETE", "PUT", "HEAD", "OPTIONS"})
 
 
 def _get_version() -> str:
@@ -130,10 +140,44 @@ _USER_AGENT = f"nexusapi-python/{VERSION}"
 def _backoff_delay(attempt: int) -> float:
     """Exponential backoff с jitter. attempt начинается с 0.
 
-    0 → 0.5..0.8s, 1 → 1.0..1.3s, 2 → 2.0..2.3s, 3+ → 4.0..4.3s.
+    0 → 0.5..0.625s, 1 → 1..1.25s, 2 → 2..2.5s, 3+ → 4..5s (jitter до +25%).
     """
     base = min(4.0, 0.5 * (2 ** attempt))
-    return base + random.uniform(0, 0.3)
+    return base * random.uniform(1.0, 1.25)
+
+
+def _truncate(text: str, limit: int = _MAX_ERROR_MESSAGE) -> str:
+    text = text.strip()
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _error_message(body: Any, text: str, status_code: int) -> str:
+    """Сообщение об ошибке из тела ответа любой формы, не длиннее 500 символов."""
+    message: Any = None
+    if isinstance(body, dict):
+        err = body.get("error")
+        detail = body.get("detail")
+        if isinstance(err, dict):
+            message = err.get("message")
+        elif isinstance(err, str):
+            message = err
+        if not message and isinstance(detail, str):
+            message = detail
+        elif not message and isinstance(detail, list) and detail:
+            first = detail[0]
+            if isinstance(first, dict):
+                # Pydantic-валидация: [{"loc": [...], "msg": ...}]
+                loc = ".".join(str(x) for x in (first.get("loc") or [])[1:]) or "request"
+                message = f"{loc}: {first.get('msg') or 'invalid'}"
+            else:
+                message = str(first)
+        elif not message and isinstance(detail, dict):
+            message = detail.get("message") or detail.get("msg") or _json.dumps(
+                detail, ensure_ascii=False,
+            )
+    elif text:
+        message = text
+    return _truncate(str(message)) if message else f"HTTP {status_code}"
 
 
 def _parse_error(resp: httpx.Response) -> tuple[str, Type[errors.NexusError], Any]:
@@ -143,30 +187,17 @@ def _parse_error(resp: httpx.Response) -> tuple[str, Type[errors.NexusError], An
     в отдельный helper потому что respond_status маппинг и message-extraction
     одинаковы.
     """
-    body: Any = None
-    message = f"HTTP {resp.status_code}"
+    text = ""
     try:
-        body = resp.json()
-    except Exception:
-        body = None
-
-    if isinstance(body, dict):
-        if isinstance(body.get("error"), dict) and body["error"].get("message"):
-            # OpenAI-shape (/v1/*)
-            message = body["error"]["message"]
-        elif isinstance(body.get("detail"), str):
-            # FastAPI string detail
-            message = body["detail"]
-        elif isinstance(body.get("detail"), list) and body["detail"]:
-            # Pydantic-validation массив с loc/msg
-            first = body["detail"][0]
-            loc = ".".join(str(x) for x in (first.get("loc") or [])[1:]) or "request"
-            msg = first.get("msg") or "invalid"
-            message = f"{loc}: {msg}"
-    else:
         text = resp.text
-        if text:
-            message = text
+    except Exception:  # битая кодировка — сообщение будет "HTTP <код>"
+        text = ""
+    body: Any = None
+    try:
+        body = _json.loads(text) if text else None
+    except ValueError:
+        body = _truncate(text, 2000) if text else None
+    message = _error_message(body, text, resp.status_code)
 
     cls_map: dict[int, Type[errors.NexusError]] = {
         400: errors.ValidationError,
@@ -182,13 +213,33 @@ def _parse_error(resp: httpx.Response) -> tuple[str, Type[errors.NexusError], An
     return message, cls, body
 
 
-def _retry_delay(resp: httpx.Response, attempt: int) -> float:
-    """Задержка перед повтором: Retry-After (секунды), если есть, иначе backoff."""
-    retry_after = resp.headers.get("retry-after")
+def _parse_retry_after(headers: Mapping[str, str]) -> Optional[float]:
+    """Retry-After в секундах: `retry-after-ms`, `retry-after` (секунды или
+    HTTP-дата). None, если заголовка нет или значение негодное (отрицательное,
+    не число, больше _MAX_RETRY_AFTER)."""
+    value: Optional[float] = None
+    raw_ms = headers.get("retry-after-ms")
+    raw = headers.get("retry-after")
     try:
-        return float(retry_after) if retry_after else _backoff_delay(attempt)
-    except (TypeError, ValueError):
-        return _backoff_delay(attempt)
+        if raw_ms:
+            value = float(raw_ms) / 1000.0
+        elif raw:
+            try:
+                value = float(raw)
+            except ValueError:
+                when = email.utils.parsedate_to_datetime(raw)
+                value = when.timestamp() - time.time()
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if value is None or not math.isfinite(value) or value < 0 or value > _MAX_RETRY_AFTER:
+        return None
+    return value
+
+
+def _retry_delay(resp: httpx.Response, attempt: int) -> float:
+    """Задержка перед повтором: Retry-After, если он разумный, иначе backoff."""
+    retry_after = _parse_retry_after(resp.headers)
+    return retry_after if retry_after is not None else _backoff_delay(attempt)
 
 
 # ============================================================
@@ -388,14 +439,17 @@ class _TaskBase:
     def is_done(self) -> bool:
         return self.status in ("completed", "failed")
 
+    def _result_dict(self) -> dict:
+        return self.result if isinstance(self.result, dict) else {}
+
     @property
     def video_url(self) -> Optional[str]:
-        return (self.result or {}).get("video_url")
+        return self._result_dict().get("video_url")
 
     @property
     def image_url(self) -> Optional[str]:
         """Берёт image_urls[0] (для моделей возвращающих список) или image_url."""
-        r = self.result or {}
+        r = self._result_dict()
         urls = r.get("image_urls")
         if isinstance(urls, list) and urls:
             return urls[0]
@@ -403,7 +457,47 @@ class _TaskBase:
 
     @property
     def image_urls(self) -> list:
-        return list((self.result or {}).get("image_urls") or [])
+        urls = self._result_dict().get("image_urls")
+        return list(urls) if isinstance(urls, list) else []
+
+    @property
+    def audio_url(self) -> Optional[str]:
+        """Берёт audio_urls[0] (Suno и др.) или audio_url."""
+        r = self._result_dict()
+        urls = r.get("audio_urls")
+        if isinstance(urls, list) and urls:
+            return urls[0]
+        return r.get("audio_url")
+
+    @property
+    def audio_urls(self) -> list:
+        urls = self._result_dict().get("audio_urls")
+        return list(urls) if isinstance(urls, list) else []
+
+    def _timeout_error(self, timeout: float) -> errors.TimeoutError:
+        err = errors.TimeoutError(
+            f"Task {self.id} did not complete within {timeout}s "
+            f"(last status: {self.status}); it is still running — wait for it again, "
+            f"do not create a new one",
+            response_body={"task_id": self.id, "last_status": self.status},
+        )
+        err.task_id, err.task = self.id, self
+        return err
+
+    def _failed_error(self) -> errors.TaskFailedError:
+        err = errors.TaskFailedError(
+            f"Task {self.id} failed: {self.error or 'unknown error'}",
+            response_body={"task_id": self.id, "error": self.error},
+        )
+        err.task_id, err.task = self.id, self
+        return err
+
+
+def _is_transient(e: errors.NexusError) -> bool:
+    """Ошибка опроса, которую стоит переждать, а не прерывать ожидание задачи."""
+    if isinstance(e, errors.NetworkError):
+        return True
+    return e.status_code is not None and (e.status_code == 429 or e.status_code >= 500)
 
 
 @dataclass
@@ -433,24 +527,28 @@ class Task(_TaskBase):
     ) -> "Task":
         """Блокируется до завершения задачи.
 
+        Временные ошибки опроса (сеть, 429, 5xx) пережидает до дедлайна.
+
         Raises:
-            TimeoutError: если задача не завершилась за `timeout` секунд.
-            TaskFailedError: если задача завершилась со status='failed'.
+            NexusTimeoutError: задача не завершилась за `timeout` секунд; она
+                продолжает идти — `.task` можно дождаться ещё раз.
+            TaskFailedError: задача завершилась со status='failed'.
         """
         deadline = time.monotonic() + timeout
         while not self.is_done:
-            if time.monotonic() > deadline:
-                raise errors.TimeoutError(
-                    f"Task {self.id} did not complete within {timeout}s",
-                    response_body={"task_id": self.id, "last_status": self.status},
-                )
-            time.sleep(poll_interval)
-            self.refresh()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise self._timeout_error(timeout)
+            time.sleep(min(poll_interval, remaining))
+            try:
+                self.refresh()
+            except errors.NexusError as e:
+                if not _is_transient(e) or time.monotonic() >= deadline:
+                    e.task_id, e.task = self.id, self
+                    raise
+                logger.info("Polling task %s failed (%s), will retry", self.id, e)
         if self.status == "failed":
-            raise errors.TaskFailedError(
-                f"Task {self.id} failed: {self.error or 'unknown error'}",
-                response_body={"task_id": self.id, "error": self.error},
-            )
+            raise self._failed_error()
         return self
 
 
@@ -479,21 +577,22 @@ class AsyncTask(_TaskBase):
         timeout: float = DEFAULT_VIDEO_WAIT_TIMEOUT,
         poll_interval: float = DEFAULT_VIDEO_POLL_INTERVAL,
     ) -> "AsyncTask":
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         while not self.is_done:
-            if loop.time() > deadline:
-                raise errors.TimeoutError(
-                    f"Task {self.id} did not complete within {timeout}s",
-                    response_body={"task_id": self.id, "last_status": self.status},
-                )
-            await asyncio.sleep(poll_interval)
-            await self.refresh()
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise self._timeout_error(timeout)
+            await asyncio.sleep(min(poll_interval, remaining))
+            try:
+                await self.refresh()
+            except errors.NexusError as e:
+                if not _is_transient(e) or loop.time() >= deadline:
+                    e.task_id, e.task = self.id, self
+                    raise
+                logger.info("Polling task %s failed (%s), will retry", self.id, e)
         if self.status == "failed":
-            raise errors.TaskFailedError(
-                f"Task {self.id} failed: {self.error or 'unknown error'}",
-                response_body={"task_id": self.id, "error": self.error},
-            )
+            raise self._failed_error()
         return self
 
 
@@ -531,8 +630,46 @@ def _generate_idempotency_key(user_key: Optional[str]) -> str:
     (а не передан юзером).
     """
     if user_key:
+        _validate_idempotency_key(user_key)
         return user_key
     return f"sdk-{uuid.uuid4()}"
+
+
+def _validate_idempotency_key(key: str) -> None:
+    """Сервер принимает ключи 8–256 символов; проверяем до отправки."""
+    if not 8 <= len(key) <= 256:
+        raise ValueError("idempotency_key must be 8-256 characters long")
+
+
+def _task_path(task_id: str) -> str:
+    if not task_id:
+        raise ValueError("task_id is required")
+    return f"/tasks/{quote(str(task_id), safe='')}"
+
+
+def _require_task_id(data: Any, idem_key: Optional[str] = None) -> str:
+    task_id = data.get("task_id") if isinstance(data, dict) else None
+    if not isinstance(task_id, str) or not task_id:
+        raise errors.APIResponseValidationError(
+            "Server response has no task_id",
+            response_body=data, idempotency_key=idem_key,
+        )
+    return task_id
+
+
+def _task_kwargs(data: Any) -> dict[str, Any]:
+    """Поля Task из ответа GET /tasks/{id}."""
+    task_id = _require_task_id(data)
+    status = data.get("status")
+    if not isinstance(status, str):
+        raise errors.APIResponseValidationError(
+            "Server response has no task status", response_body=data,
+        )
+    return {
+        "id": task_id, "status": status, "model": None,
+        "result": data.get("result"), "error": data.get("error"),
+        "created_at": data.get("created_at"),
+    }
 
 
 def _build_body(required: dict[str, Any], optional: dict[str, Any]) -> dict[str, Any]:
@@ -544,11 +681,15 @@ def _build_body(required: dict[str, Any], optional: dict[str, Any]) -> dict[str,
     return body
 
 
-def _video_path(video: Union[str, dict]) -> str:
+def _video_id(video: Union[str, dict]) -> str:
     video_id = video.get("id") if isinstance(video, dict) else video
     if not video_id:
         raise ValueError("video id is required")
-    return f"/v1/videos/{quote(str(video_id), safe='')}"
+    return str(video_id)
+
+
+def _video_path(video: Union[str, dict]) -> str:
+    return f"/v1/videos/{quote(_video_id(video), safe='')}"
 
 
 def _raise_if_video_failed(video: dict) -> None:
@@ -556,10 +697,23 @@ def _raise_if_video_failed(video: dict) -> None:
         return
     err = video.get("error") or {}
     message = err.get("message") if isinstance(err, dict) else None
-    raise errors.TaskFailedError(
+    err = errors.TaskFailedError(
         f"Video {video.get('id')} failed: {message or 'unknown error'}",
         response_body={"task_id": video.get("id"), "error": message, "video": video},
     )
+    err.task_id, err.task = video.get("id"), video
+    raise err
+
+
+def _video_timeout_error(current: dict, timeout: float) -> errors.TimeoutError:
+    err = errors.TimeoutError(
+        f"Video {current.get('id')} did not complete within {timeout}s "
+        f"(last status: {current.get('status')}); it is still running — wait for it "
+        f"again, do not create a new one",
+        response_body={"task_id": current.get("id"), "last_status": current.get("status")},
+    )
+    err.task_id, err.task = current.get("id"), current
+    return err
 
 
 _VIDEO_DONE_STATUSES = ("completed", "failed")
@@ -610,9 +764,10 @@ class Videos(_Resource):
         headers = {"Idempotency-Key": _generate_idempotency_key(idempotency_key)}
         data = self._client._request(
             "POST", "/generate", json={"params": params}, extra_headers=headers,
+            timeout=self._client._generate_timeout(),
         )
         return Task(
-            id=data["task_id"],
+            id=_require_task_id(data, headers["Idempotency-Key"]),
             status="pending",
             model=model,
             _client=self._client,
@@ -642,9 +797,11 @@ class Images(_Resource):
         headers = {"Idempotency-Key": _generate_idempotency_key(idempotency_key)}
         data = self._client._request(
             "POST", "/generate", json={"params": params}, extra_headers=headers,
+            timeout=self._client._generate_timeout(),
         )
         task = Task(
-            id=data["task_id"], status="pending", model=model, _client=self._client,
+            id=_require_task_id(data, headers["Idempotency-Key"]),
+            status="pending", model=model, _client=self._client,
         )
         if wait:
             task.wait(timeout=timeout, poll_interval=poll_interval)
@@ -653,16 +810,8 @@ class Images(_Resource):
 
 class Tasks(_Resource):
     def get(self, task_id: str) -> Task:
-        data = self._client._request("GET", f"/tasks/{task_id}")
-        return Task(
-            id=data["task_id"],
-            status=data["status"],
-            model=None,
-            result=data.get("result"),
-            error=data.get("error"),
-            created_at=data.get("created_at"),
-            _client=self._client,
-        )
+        data = self._client._request("GET", _task_path(task_id))
+        return Task(**_task_kwargs(data), _client=self._client)
 
 
 class Models(_Resource):
@@ -745,6 +894,7 @@ class ChatCompletions(_Resource):
             body["stream"] = True
             headers = {"Accept": "text/event-stream"}
             if idempotency_key:
+                _validate_idempotency_key(idempotency_key)
                 headers["Idempotency-Key"] = idempotency_key
             resp = self._client._send(
                 "POST", "/v1/chat/completions", json=body, extra_headers=headers,
@@ -838,6 +988,7 @@ class V1Videos(_Resource):
         headers = {"Idempotency-Key": _generate_idempotency_key(idempotency_key)}
         return self._client._request(
             "POST", "/v1/videos", json=body, extra_headers=headers,
+            timeout=self._client._generate_timeout(),
         )
 
     def retrieve(self, video: Union[str, dict]) -> dict:
@@ -854,23 +1005,32 @@ class V1Videos(_Resource):
     ) -> dict:
         """Опрашивает видео до completed. Принимает id или объект из create().
 
+        Временные ошибки опроса (сеть, 429, 5xx) пережидает до дедлайна.
+
         Raises:
-            NexusTimeoutError: не дождались за `timeout` секунд.
+            NexusTimeoutError: не дождались за `timeout` секунд (видео
+                продолжает генерироваться; `.task_id` — его id).
             TaskFailedError: status='failed' (деньги возвращаются на ключ).
         """
+        video_id = _video_id(video)
         deadline = time.monotonic() + timeout
+        current: dict = {"id": video_id}
         while True:
-            current = self.retrieve(video)
-            if current.get("status") in _VIDEO_DONE_STATUSES:
-                _raise_if_video_failed(current)
-                return current
-            if time.monotonic() > deadline:
-                raise errors.TimeoutError(
-                    f"Video {current.get('id')} did not complete within {timeout}s",
-                    response_body={"task_id": current.get("id"),
-                                   "last_status": current.get("status")},
-                )
-            time.sleep(poll_interval)
+            try:
+                current = self.retrieve(video_id)
+            except errors.NexusError as e:
+                if not _is_transient(e) or time.monotonic() >= deadline:
+                    e.task_id = video_id
+                    raise
+                logger.info("Polling video %s failed (%s), will retry", video_id, e)
+            else:
+                if current.get("status") in _VIDEO_DONE_STATUSES:
+                    _raise_if_video_failed(current)
+                    return current
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _video_timeout_error(current, timeout)
+            time.sleep(min(poll_interval, remaining))
 
 
 class V1:
@@ -911,9 +1071,10 @@ class AsyncVideos(_AsyncResource):
         headers = {"Idempotency-Key": _generate_idempotency_key(idempotency_key)}
         data = await self._client._request(
             "POST", "/generate", json={"params": params}, extra_headers=headers,
+            timeout=self._client._generate_timeout(),
         )
         return AsyncTask(
-            id=data["task_id"],
+            id=_require_task_id(data, headers["Idempotency-Key"]),
             status="pending",
             model=model,
             _client=self._client,
@@ -939,9 +1100,11 @@ class AsyncImages(_AsyncResource):
         headers = {"Idempotency-Key": _generate_idempotency_key(idempotency_key)}
         data = await self._client._request(
             "POST", "/generate", json={"params": params}, extra_headers=headers,
+            timeout=self._client._generate_timeout(),
         )
         task = AsyncTask(
-            id=data["task_id"], status="pending", model=model, _client=self._client,
+            id=_require_task_id(data, headers["Idempotency-Key"]),
+            status="pending", model=model, _client=self._client,
         )
         if wait:
             await task.wait(timeout=timeout, poll_interval=poll_interval)
@@ -950,16 +1113,8 @@ class AsyncImages(_AsyncResource):
 
 class AsyncTasks(_AsyncResource):
     async def get(self, task_id: str) -> AsyncTask:
-        data = await self._client._request("GET", f"/tasks/{task_id}")
-        return AsyncTask(
-            id=data["task_id"],
-            status=data["status"],
-            model=None,
-            result=data.get("result"),
-            error=data.get("error"),
-            created_at=data.get("created_at"),
-            _client=self._client,
-        )
+        data = await self._client._request("GET", _task_path(task_id))
+        return AsyncTask(**_task_kwargs(data), _client=self._client)
 
 
 class AsyncModels(_AsyncResource):
@@ -1022,6 +1177,7 @@ class AsyncChatCompletions(_AsyncResource):
             body["stream"] = True
             headers = {"Accept": "text/event-stream"}
             if idempotency_key:
+                _validate_idempotency_key(idempotency_key)
                 headers["Idempotency-Key"] = idempotency_key
             resp = await self._client._send(
                 "POST", "/v1/chat/completions", json=body, extra_headers=headers,
@@ -1094,6 +1250,7 @@ class AsyncV1Videos(_AsyncResource):
         headers = {"Idempotency-Key": _generate_idempotency_key(idempotency_key)}
         return await self._client._request(
             "POST", "/v1/videos", json=body, extra_headers=headers,
+            timeout=self._client._generate_timeout(),
         )
 
     async def retrieve(self, video: Union[str, dict]) -> dict:
@@ -1106,20 +1263,26 @@ class AsyncV1Videos(_AsyncResource):
         timeout: float = DEFAULT_VIDEO_WAIT_TIMEOUT,
         poll_interval: float = DEFAULT_VIDEO_POLL_INTERVAL,
     ) -> dict:
-        loop = asyncio.get_event_loop()
+        video_id = _video_id(video)
+        loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
+        current: dict = {"id": video_id}
         while True:
-            current = await self.retrieve(video)
-            if current.get("status") in _VIDEO_DONE_STATUSES:
-                _raise_if_video_failed(current)
-                return current
-            if loop.time() > deadline:
-                raise errors.TimeoutError(
-                    f"Video {current.get('id')} did not complete within {timeout}s",
-                    response_body={"task_id": current.get("id"),
-                                   "last_status": current.get("status")},
-                )
-            await asyncio.sleep(poll_interval)
+            try:
+                current = await self.retrieve(video_id)
+            except errors.NexusError as e:
+                if not _is_transient(e) or loop.time() >= deadline:
+                    e.task_id = video_id
+                    raise
+                logger.info("Polling video %s failed (%s), will retry", video_id, e)
+            else:
+                if current.get("status") in _VIDEO_DONE_STATUSES:
+                    _raise_if_video_failed(current)
+                    return current
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise _video_timeout_error(current, timeout)
+            await asyncio.sleep(min(poll_interval, remaining))
 
 
 class AsyncV1:
@@ -1162,7 +1325,7 @@ class NexusClient:
         if max_retries < 0:
             raise ValueError("max_retries must be >= 0")
         self._api_key = api_key
-        self._base_url = base_url.rstrip("/")
+        self._base_url = _normalize_base_url(base_url)
         self._timeout = timeout
         self._max_retries = max_retries
         self._http = httpx.Client(
@@ -1179,6 +1342,9 @@ class NexusClient:
 
     def _long_timeout(self, timeout: Optional[float]) -> httpx.Timeout:
         return _long_timeout(self._timeout, timeout)
+
+    def _generate_timeout(self) -> httpx.Timeout:
+        return _long_timeout(self._timeout, None, minimum=DEFAULT_GENERATE_TIMEOUT)
 
     def _send(
         self,
@@ -1208,6 +1374,8 @@ class NexusClient:
             retry_sent_errors = not stream
 
         attempt = 0
+        conflict_attempt = 0
+        conflict_deadline: Optional[float] = None
         while True:
             request = self._http.build_request(
                 method, url, json=json, params=params, headers=headers,
@@ -1216,32 +1384,35 @@ class NexusClient:
             try:
                 resp = self._http.send(request, stream=stream)
             except httpx.TransportError as e:
-                retryable = isinstance(e, (httpx.NetworkError, httpx.TimeoutException)) and (
-                    retry_sent_errors or isinstance(e, _NOT_SENT_ERRORS)
-                )
-                if retryable and attempt < self._max_retries:
+                if _retryable_transport_error(e, retry_sent_errors) and attempt < self._max_retries:
                     delay = _backoff_delay(attempt)
-                    logger.debug(
-                        "Network error %s on %s %s (attempt %d/%d), retrying in %.2fs",
-                        e.__class__.__name__, method, path, attempt + 1,
-                        self._max_retries + 1, delay,
-                    )
+                    _log_retry(method, path, attempt, self._max_retries, delay, type(e).__name__)
                     time.sleep(delay)
                     attempt += 1
                     continue
-                raise _network_error(e, attempt, idem_key) from e
+                raise _network_error(e, attempt, idem_key, stream) from e
 
             if resp.status_code in retry_statuses and attempt < self._max_retries:
                 delay = _retry_delay(resp, attempt)
                 resp.close()
-                logger.debug(
-                    "HTTP %d on %s %s (attempt %d/%d), retrying in %.2fs",
-                    resp.status_code, method, path, attempt + 1,
-                    self._max_retries + 1, delay,
-                )
+                _log_retry(method, path, attempt, self._max_retries, delay, f"HTTP {resp.status_code}")
                 time.sleep(delay)
                 attempt += 1
                 continue
+
+            # 409 после повтора самого SDK: первый запрос с этим ключом ещё
+            # выполняется на сервере. Ждём его сохранённый ответ, а не сдаёмся.
+            if resp.status_code == 409 and idem_key and attempt > 0 and not stream:
+                now = time.monotonic()
+                if conflict_deadline is None:
+                    conflict_deadline = now + _CONFLICT_WAIT_BUDGET
+                if now < conflict_deadline:
+                    delay = min(_backoff_delay(conflict_attempt), 5.0, conflict_deadline - now)
+                    resp.close()
+                    _log_retry(method, path, attempt, self._max_retries, delay, "HTTP 409 (in progress)")
+                    time.sleep(delay)
+                    conflict_attempt += 1
+                    continue
 
             if not resp.is_success:
                 if stream:
@@ -1249,11 +1420,7 @@ class NexusClient:
                         resp.read()
                     finally:
                         resp.close()
-                message, cls, body = _parse_error(resp)
-                raise cls(
-                    message, status_code=resp.status_code, response_body=body,
-                    idempotency_key=idem_key,
-                )
+                raise _status_error(resp, idem_key)
             return resp
 
     def _request(
@@ -1274,17 +1441,15 @@ class NexusClient:
             extra_headers=extra_headers, timeout=timeout,
             retry_statuses=retry_statuses, retry_sent_errors=retry_sent_errors,
         )
-        if resp.status_code == 204 or not resp.content:
-            return None
-        return resp.json()
+        return _decode_json(resp, (extra_headers or {}).get("Idempotency-Key"))
 
     def close(self) -> None:
         self._http.close()
 
-    def __enter__(self):
+    def __enter__(self) -> "NexusClient":
         return self
 
-    def __exit__(self, *args):
+    def __exit__(self, *args: Any) -> None:
         self.close()
 
 
@@ -1316,7 +1481,7 @@ class AsyncNexusClient:
         if max_retries < 0:
             raise ValueError("max_retries must be >= 0")
         self._api_key = api_key
-        self._base_url = base_url.rstrip("/")
+        self._base_url = _normalize_base_url(base_url)
         self._timeout = timeout
         self._max_retries = max_retries
         self._http = httpx.AsyncClient(
@@ -1333,6 +1498,9 @@ class AsyncNexusClient:
 
     def _long_timeout(self, timeout: Optional[float]) -> httpx.Timeout:
         return _long_timeout(self._timeout, timeout)
+
+    def _generate_timeout(self) -> httpx.Timeout:
+        return _long_timeout(self._timeout, None, minimum=DEFAULT_GENERATE_TIMEOUT)
 
     async def _send(
         self,
@@ -1354,7 +1522,10 @@ class AsyncNexusClient:
         if retry_sent_errors is None:
             retry_sent_errors = not stream
 
+        loop = asyncio.get_running_loop()
         attempt = 0
+        conflict_attempt = 0
+        conflict_deadline: Optional[float] = None
         while True:
             request = self._http.build_request(
                 method, url, json=json, params=params, headers=headers,
@@ -1363,32 +1534,35 @@ class AsyncNexusClient:
             try:
                 resp = await self._http.send(request, stream=stream)
             except httpx.TransportError as e:
-                retryable = isinstance(e, (httpx.NetworkError, httpx.TimeoutException)) and (
-                    retry_sent_errors or isinstance(e, _NOT_SENT_ERRORS)
-                )
-                if retryable and attempt < self._max_retries:
+                if _retryable_transport_error(e, retry_sent_errors) and attempt < self._max_retries:
                     delay = _backoff_delay(attempt)
-                    logger.debug(
-                        "Network error %s on %s %s (attempt %d/%d), retrying in %.2fs",
-                        e.__class__.__name__, method, path, attempt + 1,
-                        self._max_retries + 1, delay,
-                    )
+                    _log_retry(method, path, attempt, self._max_retries, delay, type(e).__name__)
                     await asyncio.sleep(delay)
                     attempt += 1
                     continue
-                raise _network_error(e, attempt, idem_key) from e
+                raise _network_error(e, attempt, idem_key, stream) from e
 
             if resp.status_code in retry_statuses and attempt < self._max_retries:
                 delay = _retry_delay(resp, attempt)
                 await resp.aclose()
-                logger.debug(
-                    "HTTP %d on %s %s (attempt %d/%d), retrying in %.2fs",
-                    resp.status_code, method, path, attempt + 1,
-                    self._max_retries + 1, delay,
-                )
+                _log_retry(method, path, attempt, self._max_retries, delay, f"HTTP {resp.status_code}")
                 await asyncio.sleep(delay)
                 attempt += 1
                 continue
+
+            # 409 после повтора самого SDK: первый запрос с этим ключом ещё
+            # выполняется на сервере. Ждём его сохранённый ответ, а не сдаёмся.
+            if resp.status_code == 409 and idem_key and attempt > 0 and not stream:
+                now = loop.time()
+                if conflict_deadline is None:
+                    conflict_deadline = now + _CONFLICT_WAIT_BUDGET
+                if now < conflict_deadline:
+                    delay = min(_backoff_delay(conflict_attempt), 5.0, conflict_deadline - now)
+                    await resp.aclose()
+                    _log_retry(method, path, attempt, self._max_retries, delay, "HTTP 409 (in progress)")
+                    await asyncio.sleep(delay)
+                    conflict_attempt += 1
+                    continue
 
             if not resp.is_success:
                 if stream:
@@ -1396,11 +1570,7 @@ class AsyncNexusClient:
                         await resp.aread()
                     finally:
                         await resp.aclose()
-                message, cls, body = _parse_error(resp)
-                raise cls(
-                    message, status_code=resp.status_code, response_body=body,
-                    idempotency_key=idem_key,
-                )
+                raise _status_error(resp, idem_key)
             return resp
 
     async def _request(
@@ -1421,30 +1591,89 @@ class AsyncNexusClient:
             extra_headers=extra_headers, timeout=timeout,
             retry_statuses=retry_statuses, retry_sent_errors=retry_sent_errors,
         )
-        if resp.status_code == 204 or not resp.content:
-            return None
-        return resp.json()
+        return _decode_json(resp, (extra_headers or {}).get("Idempotency-Key"))
 
     async def close(self) -> None:
         await self._http.aclose()
 
-    async def __aenter__(self):
+    async def __aenter__(self) -> "AsyncNexusClient":
         return self
 
-    async def __aexit__(self, *args):
+    async def __aexit__(self, *args: Any) -> None:
         await self.close()
 
 
+def _retryable_transport_error(e: Exception, retry_sent_errors: bool) -> bool:
+    if not isinstance(e, (httpx.NetworkError, httpx.TimeoutException)):
+        return False  # протокол/прокси/неверный URL — повтор не поможет
+    return retry_sent_errors or isinstance(e, _NOT_SENT_ERRORS)
+
+
+def _log_retry(
+    method: str, path: str, attempt: int, max_retries: int, delay: float, reason: str,
+) -> None:
+    logger.info(
+        "%s on %s %s (attempt %d of %d), retrying in %.2fs",
+        reason, method, path, attempt + 1, max_retries + 1, delay,
+    )
+
+
 def _network_error(
-    e: Exception, attempt: int, idem_key: Optional[str],
+    e: Exception, attempt: int, idem_key: Optional[str], stream: bool,
 ) -> errors.NetworkError:
-    message = f"Network error after {attempt + 1} attempts: {e}"
-    if idem_key and not isinstance(e, _NOT_SENT_ERRORS):
-        message += (
-            f". The request may still be running on the server: repeat the call with "
-            f"idempotency_key={idem_key!r} to get its result without a second charge"
-        )
+    if isinstance(e, _NOT_SENT_ERRORS):
+        message = f"Could not connect after {attempt + 1} attempts: {e}"
+    else:
+        message = f"Network error after {attempt + 1} attempts: {e}"
+        if stream:
+            message += (
+                ". The request may have reached the server; a streamed response "
+                "cannot be replayed"
+            )
+        elif idem_key:
+            message += (
+                f". The request reached the server and may still be running (and be "
+                f"charged): repeat it with idempotency_key={idem_key!r}, not a new key — "
+                f"once it has finished successfully the server returns the stored result"
+            )
     return errors.NetworkError(message, idempotency_key=idem_key)
+
+
+def _status_error(resp: httpx.Response, idem_key: Optional[str]) -> errors.NexusError:
+    message, cls, body = _parse_error(resp)
+    return cls(
+        message, status_code=resp.status_code, response_body=body,
+        idempotency_key=idem_key, headers=dict(resp.headers),
+    )
+
+
+def _decode_json(resp: httpx.Response, idem_key: Optional[str]) -> Any:
+    if resp.status_code == 204 or not resp.content:
+        return None
+    try:
+        return resp.json()
+    except ValueError as e:
+        raise errors.APIResponseValidationError(
+            f"Invalid JSON in HTTP {resp.status_code} response",
+            status_code=resp.status_code, response_body=_truncate(resp.text, 2000),
+            idempotency_key=idem_key, headers=dict(resp.headers),
+        ) from e
+
+
+def _normalize_base_url(base_url: str) -> str:
+    url = base_url.rstrip("/")
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        raise ValueError(f"base_url must be an http(s) URL, got {base_url!r}")
+    if url.endswith("/v1"):
+        url = url[: -len("/v1")]
+        warnings.warn(
+            f"base_url should not end with /v1 (the SDK adds it where needed); "
+            f"using {url!r}",
+            UserWarning,
+            stacklevel=3,
+        )
+    return url
 
 
 def _request_headers(api_key: str, auth: bool, extra_headers: Optional[dict]) -> dict[str, str]:
@@ -1456,9 +1685,13 @@ def _request_headers(api_key: str, auth: bool, extra_headers: Optional[dict]) ->
     return headers
 
 
-def _long_timeout(client_timeout: Any, timeout: Optional[float]) -> httpx.Timeout:
-    """Таймаут для долгих синхронных /v1-запросов: чтение — `timeout` или не
-    меньше DEFAULT_LONG_REQUEST_TIMEOUT, подключение — обычный таймаут клиента."""
+def _long_timeout(
+    client_timeout: Any,
+    timeout: Optional[float],
+    minimum: float = DEFAULT_LONG_REQUEST_TIMEOUT,
+) -> httpx.Timeout:
+    """Таймаут для долгих запросов: чтение — `timeout` или не меньше `minimum`,
+    подключение — обычный таймаут клиента."""
     if isinstance(client_timeout, httpx.Timeout):
         connect, base = client_timeout.connect, client_timeout.read
     else:
@@ -1468,7 +1701,7 @@ def _long_timeout(client_timeout: Any, timeout: Optional[float]) -> httpx.Timeou
     elif base is None:
         read = None  # клиент без таймаута — так и оставляем
     else:
-        read = max(base, DEFAULT_LONG_REQUEST_TIMEOUT)
+        read = max(base, minimum)
     if connect is not None and read is not None:
         connect = min(connect, read)
     return httpx.Timeout(read, connect=connect)

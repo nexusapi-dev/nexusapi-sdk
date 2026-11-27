@@ -3,9 +3,13 @@
  * Не экспортируются из пакета.
  */
 
-// node:crypto, а не globalThis.crypto: в Node 18 глобальный WebCrypto
-// включается только флагом --experimental-global-webcrypto.
-import { randomUUID } from "node:crypto";
+import { NetworkError, NexusError } from "./errors.js";
+
+/** Ошибка опроса, которую стоит переждать, а не прерывать ожидание задачи. */
+export function isTransientError(e: unknown): boolean {
+  if (e instanceof NetworkError) return true;
+  return e instanceof NexusError && e.status !== undefined && (e.status === 429 || e.status >= 500);
+}
 
 // Статусы которые retry'им. 429 — даём rate-limit отпустить, 5xx — серверная
 // нестабильность которая может пройти сама.
@@ -23,20 +27,107 @@ export const SAFE_RETRY_STATUSES: ReadonlySet<number> = new Set([429, 503]);
 // 300 с; дольше — только со своим fetch (undici Agent с headersTimeout: 0).
 export const DEFAULT_LONG_TIMEOUT_MS = 600_000;
 
+// POST /generate у части моделей до ответа проверяет входные файлы (до 90 с).
+export const DEFAULT_GENERATE_TIMEOUT_MS = 120_000;
+
+// Больше Retry-After не ждём: вместо часового сна — backoff.
+export const MAX_RETRY_AFTER_MS = 60_000;
+
+// Сколько ждать, пока сервер закончит первый запрос, если повтор самого SDK
+// получил 409 «ещё выполняется».
+export const CONFLICT_WAIT_BUDGET_MS = 120_000;
+
+// Максимум для setTimeout: больше Node превращает в 1 мс.
+export const MAX_TIMER_MS = 2_147_483_647;
+
 export function generateIdempotencyKey(userKey?: string): string {
-  if (userKey) return userKey;
+  if (userKey) {
+    validateIdempotencyKey(userKey);
+    return userKey;
+  }
   // Префикс sdk- помогает отличить в логах автогенерацию от user-provided.
   return `sdk-${randomUUID()}`;
 }
 
-export function backoffDelayMs(attempt: number): number {
-  // 0 → 500-800, 1 → 1000-1300, 2 → 2000-2300, 3+ → 4000-4300.
-  const base = Math.min(4000, 500 * 2 ** attempt);
-  return base + Math.floor(Math.random() * 300);
+/** Сервер принимает ключи 8–256 символов; проверяем до отправки. */
+export function validateIdempotencyKey(key: string): void {
+  if (key.length < 8 || key.length > 256) {
+    throw new RangeError("idempotencyKey must be 8-256 characters long");
+  }
+  // Значение HTTP-заголовка: только печатные ASCII, иначе fetch бросит TypeError.
+  if (!/^[\x20-\x7e]+$/.test(key)) {
+    throw new RangeError("idempotencyKey must contain printable ASCII characters only");
+  }
 }
 
-export function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
+/**
+ * UUID v4 без статического импорта node:crypto, чтобы пакет собирался и под
+ * браузер/edge. В Node 18 без флага глобального crypto нет — тогда ключ из
+ * Math.random: он не секретный, важна только уникальность.
+ */
+function randomUUID(): string {
+  const c = (globalThis as { crypto?: { randomUUID?: () => string } }).crypto;
+  if (typeof c?.randomUUID === "function") return c.randomUUID();
+  const hex = Array.from({ length: 32 }, () => Math.floor(Math.random() * 16).toString(16));
+  hex[12] = "4";
+  hex[16] = ((parseInt(hex[16]!, 16) & 0x3) | 0x8).toString(16);
+  const s = hex.join("");
+  return `${s.slice(0, 8)}-${s.slice(8, 12)}-${s.slice(12, 16)}-${s.slice(16, 20)}-${s.slice(20)}`;
+}
+
+export function backoffDelayMs(attempt: number): number {
+  // 0 → 500-625, 1 → 1000-1250, 2 → 2000-2500, 3+ → 4000-5000 (jitter до +25%).
+  const base = Math.min(4000, 500 * 2 ** attempt);
+  return Math.round(base * (1 + Math.random() * 0.25));
+}
+
+/**
+ * Retry-After в мс: `retry-after-ms`, `retry-after` (секунды или HTTP-дата).
+ * undefined, если заголовка нет или значение негодное (отрицательное, не число,
+ * больше MAX_RETRY_AFTER_MS).
+ */
+export function parseRetryAfterMs(headers: Headers): number | undefined {
+  let ms: number | undefined;
+  const rawMs = headers.get("retry-after-ms");
+  const raw = headers.get("retry-after");
+  if (rawMs) {
+    ms = Number(rawMs);
+  } else if (raw) {
+    const seconds = Number(raw);
+    if (raw.trim() !== "" && !Number.isNaN(seconds)) {
+      ms = seconds * 1000;
+    } else {
+      const date = Date.parse(raw);
+      if (!Number.isNaN(date)) ms = date - Date.now();
+    }
+  }
+  if (ms === undefined || !Number.isFinite(ms) || ms < 0 || ms > MAX_RETRY_AFTER_MS) {
+    return undefined;
+  }
+  return ms;
+}
+
+/** Пауза, которую можно прервать signal'ом (тогда — reject с signal.reason). */
+export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(abortReason(signal));
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(abortReason(signal!));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, Math.min(Math.max(0, ms), MAX_TIMER_MS));
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+export function abortReason(signal: AbortSignal): unknown {
+  return signal.reason ?? new DOMException("This operation was aborted", "AbortError");
 }
 
 /** Копия объекта без undefined/null значений. */
@@ -46,6 +137,11 @@ export function compact(obj: Record<string, unknown>): Record<string, unknown> {
     if (v !== undefined && v !== null) out[k] = v;
   }
   return out;
+}
+
+export function truncate(text: string, limit = 500): string {
+  const t = text.trim();
+  return t.length <= limit ? t : `${t.slice(0, limit)}…`;
 }
 
 // Коды ошибок, при которых запрос точно не ушёл на сервер (не подключились).
@@ -64,6 +160,9 @@ export function isNotSentError(e: unknown): boolean {
   for (let depth = 0; cur && depth < 4; depth += 1) {
     const code = (cur as { code?: unknown }).code;
     if (typeof code === "string" && NOT_SENT_CODES.has(code)) return true;
+    // undici при двух адресах (IPv4/IPv6) складывает ошибки в AggregateError.
+    const errs = (cur as { errors?: unknown }).errors;
+    if (Array.isArray(errs) && errs.length > 0 && errs.every((x) => isNotSentError(x))) return true;
     cur = (cur as { cause?: unknown }).cause;
   }
   return false;

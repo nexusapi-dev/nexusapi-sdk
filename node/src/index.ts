@@ -10,6 +10,7 @@ export {
   type TaskResult,
   type TaskStatus,
   type VideoCreateParams,
+  type WaitOptions,
 } from "./client.js";
 
 export { Stream } from "./streaming.js";
@@ -31,6 +32,7 @@ export {
 } from "./v1.js";
 
 export {
+  APIResponseValidationError,
   AuthenticationError,
   BillingError,
   ConflictError,

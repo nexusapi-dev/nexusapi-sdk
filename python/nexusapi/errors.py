@@ -2,11 +2,23 @@
 
 Все исключения наследуются от NexusError — `except NexusError` ловит всё.
 """
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 
 class NexusError(Exception):
-    """Базовое исключение. Несёт HTTP-статус и raw-ответ для отладки."""
+    """Базовое исключение. Несёт HTTP-статус и raw-ответ для отладки.
+
+    Атрибуты (все могут быть None):
+        status_code: HTTP-статус ответа.
+        response_body: тело ответа (dict, если сервер вернул JSON).
+        headers: заголовки ответа.
+        idempotency_key: Idempotency-Key запроса. Повтор с ним безопасен после
+            NetworkError, ConflictError и ошибок 4xx: если первый запрос
+            выполнился, сервер вернёт его сохранённый ответ. После 5xx сервер
+            ответ не сохраняет — запрос мог быть оплачен, проверьте результат
+            (например, client.tasks.get) прежде чем повторять.
+        task_id, task: задача, к которой относится ошибка (у ошибок ожидания).
+    """
 
     def __init__(
         self,
@@ -14,15 +26,16 @@ class NexusError(Exception):
         status_code: Optional[int] = None,
         response_body: Optional[Any] = None,
         idempotency_key: Optional[str] = None,
+        headers: Optional[Mapping[str, str]] = None,
     ):
         super().__init__(message)
         self.message = message
         self.status_code = status_code
         self.response_body = response_body
-        # Idempotency-Key запроса, на котором случилась ошибка (если был).
-        # Повтор вызова с этим ключом вернёт результат первого запроса без
-        # второго списания, если тот всё-таки выполнился на сервере.
         self.idempotency_key = idempotency_key
+        self.headers = headers
+        self.task_id: Optional[str] = None
+        self.task: Any = None
 
     def __repr__(self) -> str:
         return (
@@ -58,8 +71,9 @@ class NotFoundError(NexusError):
 class ConflictError(NexusError):
     """409 — запрос с этим Idempotency-Key ещё выполняется на сервере.
 
-    Повторите позже с тем же ключом: когда первый запрос закончится, сервер
-    вернёт его сохранённый ответ без второго списания.
+    Если 409 вызван повтором самого SDK, SDK ждёт до ~2 минут, пока первый
+    запрос закончится. Повторите позже с тем же ключом: когда первый запрос
+    завершится успешно, сервер вернёт его сохранённый ответ.
     """
 
 
@@ -71,15 +85,24 @@ class StreamError(NexusError):
     """
 
 
+class APIResponseValidationError(NexusError):
+    """Ответ сервера не того формата: не JSON (например, HTML-страница прокси)
+    или без обязательного поля. `.response_body` — начало тела ответа."""
+
+
 class TimeoutError(NexusError):  # noqa: A001 — намеренно перекрываем builtin
-    """Task.wait() превысил deadline без завершения задачи (client-side)."""
+    """Task.wait() превысил deadline без завершения задачи (client-side).
+
+    Задача при этом продолжает выполняться: `.task_id` / `.task` — чтобы
+    дождаться её позже, а не создавать (и оплачивать) новую.
+    """
 
 
 class TaskFailedError(NexusError):
     """Задача завершилась со status='failed' — провайдер не смог сгенерировать.
 
     Деньги при этом уже возвращены на ключ (refund flow в backend). См.
-    `.response_body["task_id"]` и `.response_body["error"]` для деталей.
+    `.task_id` и `.response_body["error"]` для деталей.
     """
 
 
@@ -88,7 +111,8 @@ class NetworkError(NexusError):
     больше не повторяет запрос.
 
     Долгие запросы (чат, v1.images.generate) после обрыва уже отправленного
-    запроса SDK сам не повторяет: генерация могла идти на сервере. Повторите
-    вызов с `idempotency_key=err.idempotency_key` — получите её результат без
-    второго списания (пока она идёт — ConflictError).
+    запроса SDK сам не повторяет: генерация могла идти на сервере и быть
+    оплачена. Повторяйте с `idempotency_key=err.idempotency_key`, а не с новым
+    ключом: если запрос завершился успешно, сервер вернёт его сохранённый
+    ответ; пока он идёт — ConflictError.
     """

@@ -1,0 +1,17 @@
+name: Предложение
+description: Новый метод, параметр или улучшение SDK
+labels: [enhancement]
+body:
+  - type: dropdown
+    id: sdk
+    attributes:
+      label: SDK
+      options: [Python, Node.js, Оба]
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: Что нужно и зачем
+    validations:
+      required: true

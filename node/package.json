@@ -1,6 +1,6 @@
 {
   "name": "nexusapi-sdk",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Node.js / TypeScript SDK for NexusAPI — video, image and text models through a single API (Veo, Kling, Seedance, Nano-Banana, Claude, GPT). OpenAI-compatible /v1 with streaming. Auto-retries, auto idempotency.",
   "keywords": [
     "ai",
@@ -20,7 +20,7 @@
     "idempotency-key",
     "nexusapi"
   ],
-  "homepage": "https://nexusapi.dev",
+  "homepage": "https://docs.nexusapi.dev/sdks/",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/nexusapi-dev/nexusapi-sdk.git",
@@ -32,7 +32,7 @@
   "author": {
     "name": "NexusAPI",
     "email": "support@nexusapi.dev",
-    "url": "https://nexusapi.dev"
+    "url": "https://docs.nexusapi.dev"
   },
   "license": "MIT",
   "type": "module",
@@ -42,8 +42,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
-    }
+    },
+    "./package.json": "./package.json"
   },
+  "sideEffects": false,
   "files": [
     "dist",
     "README.md",
