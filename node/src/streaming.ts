@@ -25,7 +25,8 @@ function choiceIndex(value: unknown): number {
  */
 function mergeFragment(target: Json, fragment: Json): void {
   for (const [key, value] of Object.entries(fragment)) {
-    if (UNSAFE_KEYS.has(key)) continue;
+    // Явные сравнения, а не UNSAFE_KEYS.has: так защиту видят и анализаторы (CodeQL).
+    if (key === "__proto__" || key === "constructor" || key === "prototype") continue;
     if (value === null || value === undefined) {
       if (!Object.hasOwn(target, key)) target[key] = null;
       continue;

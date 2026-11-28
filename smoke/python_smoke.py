@@ -69,13 +69,14 @@ def main() -> int:
         check("public catalog", lambda: f"{len(client.models.list())} models")
         check("auth + /v1/models", lambda: f"{len(client.v1.models.list())} models for this key")
 
-        def secret() -> str:
-            value = client.webhooks.secret()
-            if value != webhooks.secret_from_api_key(api_key):
+        def webhook_signing_matches() -> str:
+            # Сам секрет не печатаем: сравниваем и возвращаем только итог.
+            same = client.webhooks.secret() == webhooks.secret_from_api_key(api_key)
+            if not same:
                 raise AssertionError("server secret differs from SDK derivation")
             return "matches SDK derivation"
 
-        check("webhook secret", secret)
+        check("webhook secret", webhook_signing_matches)
         check("unknown task → 404", lambda: expect_not_found(lambda: client.tasks.get(f"smoke-{uuid.uuid4().hex}")))
         check("unknown chat model → 404",
               lambda: expect_not_found(lambda: client.chat.completions.create(model="no-such-model", messages=[])))
