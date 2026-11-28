@@ -35,7 +35,8 @@ git push origin python-sdk-v0.3.1 node-sdk-v0.3.1
    **Review deployments → Approve**) и публикует собранный пакет.
 
 У npm-пакета будет provenance («Built and signed on GitHub Actions»), у PyPI —
-attestations. Теги `python-sdk-v*` / `node-sdk-v*` может создать только админ
+attestations. После публикации workflow создаёт GitHub Release с заметками из
+CHANGELOG.md и файлами пакета. Теги `python-sdk-v*` / `node-sdk-v*` может создать только админ
 репозитория.
 
 **Проверка без публикации:** Actions → нужный workflow → «Run workflow».
@@ -85,5 +86,6 @@ Settings → Environments: окружения `pypi` и `npm` создаются
 - [ ] Новые методы описаны в README пакета
 - [ ] Локально: `python -m build && twine check dist/*`, `npm test && npm pack --dry-run`
 - [ ] CI на main зелёный
+- [ ] Смоук-тест против живого API: `python smoke/python_smoke.py --paid` и `node smoke/node_smoke.mjs --paid`
 - [ ] Запушены теги `python-sdk-v*` / `node-sdk-v*`
 - [ ] Workflow публикации зелёный, новая версия видна на PyPI / npm

@@ -281,7 +281,7 @@ def test_typed_responses_are_plain_dicts():
 
     models = _client(handler).v1.models.list()
     assert isinstance(models[0], dict) and models[0]["id"] == "m"
-    assert hasattr(nexusapi.types, "ChatCompletion") and nexusapi.__version__ == "0.4.0"
+    assert hasattr(nexusapi.types, "ChatCompletion") and nexusapi.__version__ == "0.5.0"
 
 
 # ============================================================
@@ -343,12 +343,12 @@ def test_chat_retries_stop_after_lock_window(monkeypatch):
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls["n"] += 1
-        clock["t"] += 600  # nginx отдал 504 через 600 с
+        clock["t"] += 850  # ответ пришёл позже окна повторов (840 с)
         return httpx.Response(504, json={"error": {"message": "gateway timeout"}})
 
     with pytest.raises(InternalServerError):
         _client(handler, max_retries=3).chat.completions.create(model="m", messages=[])
-    assert calls["n"] == 1  # после 540 с повтор мог бы запустить модель второй раз
+    assert calls["n"] == 1  # ближе к концу замка (900 с) повтор мог бы запустить модель второй раз
 
 
 def test_images_do_not_retry_failed_task_500(no_sleep):
@@ -405,3 +405,158 @@ def test_stream_timeout_is_api_timeout_error():
     next(stream)
     with pytest.raises(APITimeoutError):
         next(stream)
+
+
+# ============================================================
+# 0.5.0: помощники стрима
+# ============================================================
+
+
+def _sse_body(*events: dict, usage: dict | None = None) -> bytes:
+    out = "".join(f"data: {json.dumps(e)}\n\n" for e in events)
+    if usage is not None:
+        out += f"data: {json.dumps({'id': 'c-1', 'choices': [], 'usage': usage})}\n\n"
+    return (out + "data: [DONE]\n\n").encode()
+
+
+CHUNKS = [
+    {"id": "c-1", "created": 1, "model": "m", "choices": [{"index": 0, "delta": {"role": "assistant", "content": "При"}}]},
+    {"id": "c-1", "choices": [{"index": 0, "delta": {"content": "вет"}}]},
+    {"id": "c-1", "choices": [{"index": 0, "delta": {"tool_calls": [
+        {"index": 0, "id": "call_1", "type": "function", "function": {"name": "get_", "arguments": '{"ci'}}]}}]},
+    {"id": "c-1", "choices": [{"index": 0, "delta": {"tool_calls": [
+        {"index": 0, "function": {"name": "weather", "arguments": 'ty": "Baku"}'}}]}, "finish_reason": "tool_calls"}]},
+]
+
+
+def test_stream_text_and_final_completion():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_sse_body(*CHUNKS, usage={"prompt_tokens": 3, "completion_tokens": 5}))
+
+    client = _client(handler)
+    assert client.chat.completions.create(model="m", messages=[], stream=True).text() == "Привет"
+    reply = client.chat.completions.create(model="m", messages=[], stream=True).final_completion()
+    assert reply["object"] == "chat.completion" and reply["id"] == "c-1" and reply["model"] == "m"
+    message = reply["choices"][0]["message"]
+    assert message["role"] == "assistant" and message["content"] == "Привет"
+    assert message["tool_calls"] == [{"id": "call_1", "type": "function",
+                                      "function": {"name": "get_weather", "arguments": '{"city": "Baku"}'}}]
+    assert reply["choices"][0]["finish_reason"] == "tool_calls"
+    assert reply["usage"] == {"prompt_tokens": 3, "completion_tokens": 5}
+
+
+@pytest.mark.asyncio
+async def test_async_stream_helpers():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_sse_body(*CHUNKS[:2]))
+
+    async with AsyncNexusClient(api_key="k", base_url="https://api.test", transport=httpx.MockTransport(handler)) as c:
+        assert await (await c.chat.completions.create(model="m", messages=[], stream=True)).text() == "Привет"
+        reply = await (await c.chat.completions.create(model="m", messages=[], stream=True)).final_completion()
+        assert reply["choices"][0]["message"]["content"] == "Привет" and "usage" not in reply
+
+
+def test_chat_retry_window_is_840s():
+    import nexusapi.client as cm
+
+    assert cm._CHAT_RETRY_WINDOW == 840.0
+
+
+def _stream(handler_body: bytes) -> Any:
+    return _client(lambda r: httpx.Response(200, content=handler_body)).chat.completions.create(
+        model="m", messages=[], stream=True,
+    )
+
+
+def test_stream_helpers_include_chunks_already_read():
+    body = _sse_body(*CHUNKS, usage={"prompt_tokens": 3, "completion_tokens": 5})
+    stream = _stream(body)
+    next(stream)  # часть уже прочитана в цикле
+    assert stream.text() == "Привет"
+    assert stream.text() == "Привет"  # повторный вызов — тот же результат
+
+    stream = _stream(body)
+    for _ in stream:  # «напечатали в цикле, потом нужен итог»
+        pass
+    final = stream.final_completion()
+    assert final["choices"][0]["message"]["content"] == "Привет"
+    assert final["usage"] == {"prompt_tokens": 3, "completion_tokens": 5}
+    final["choices"][0]["message"]["content"] = "изменено"
+    assert stream.final_completion()["choices"][0]["message"]["content"] == "Привет"
+
+
+def test_stream_final_completion_keeps_refusal_logprobs_and_unknown_fields():
+    body = _sse_body(
+        {"id": "c-1", "model": "m", "service_tier": "default",
+         "choices": [{"index": 0, "delta": {"role": "assistant", "refusal": "Не "},
+                      "logprobs": {"content": [{"token": "Не", "logprob": -0.1}]}}]},
+        {"id": "c-1", "choices": [{"index": 0, "delta": {"refusal": "могу"},
+                                   "logprobs": {"content": [{"token": " могу", "logprob": -0.2}]},
+                                   "finish_reason": "stop"}]},
+        {"id": "c-1", "choices": [{"index": 1, "delta": {"content": ""}, "finish_reason": "stop"}]},
+    )
+    final = _stream(body).final_completion()
+    first, second = final["choices"]
+    assert first["message"] == {"role": "assistant", "content": None, "refusal": "Не могу"}
+    assert [t["token"] for t in first["logprobs"]["content"]] == ["Не", " могу"]
+    assert final["service_tier"] == "default"
+    assert second["index"] == 1 and second["message"]["content"] == ""
+
+
+def test_stream_helpers_reraise_stream_error():
+    body = (_sse_body(CHUNKS[0])[: -len(b"data: [DONE]\n\n")]
+            + b'data: {"error": {"message": "upstream failed"}}\n\n')
+    stream = _stream(body)
+    with pytest.raises(nexusapi.StreamError):
+        for _ in stream:
+            pass
+    with pytest.raises(nexusapi.StreamError):
+        stream.final_completion()  # итога нет — не делаем вид, что ответ полный
+
+
+def test_stream_helpers_after_close_return_what_arrived():
+    stream = _stream(_sse_body(*CHUNKS))
+    next(stream)
+    stream.close()
+    final = stream.final_completion()
+    assert final["choices"][0]["message"]["content"] == "При"
+    assert final["choices"][0]["finish_reason"] is None
+
+
+@pytest.mark.asyncio
+async def test_async_stream_helpers_include_chunks_already_read():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_sse_body(*CHUNKS))
+
+    async with AsyncNexusClient(api_key="k", base_url="https://api.test", transport=httpx.MockTransport(handler)) as c:
+        stream = await c.chat.completions.create(model="m", messages=[], stream=True)
+        await stream.__anext__()
+        assert await stream.text() == "Привет"
+        final = await stream.final_completion()
+        assert final["choices"][0]["finish_reason"] == "tool_calls"
+
+
+@pytest.mark.parametrize(("retry_after", "calls_expected"), [("60", 1), ("0", 2)])
+def test_chat_retry_must_be_sent_inside_lock_window(monkeypatch, retry_after, calls_expected):
+    """Повтор уходит через Retry-After: если он попадёт за 840 с, не повторяем."""
+    import nexusapi.client as cm
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(cm.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(cm.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            clock["t"] = 839.0
+            return httpx.Response(429, headers={"Retry-After": retry_after}, json={"error": {"message": "busy"}})
+        return httpx.Response(200, json={"id": "c", "object": "chat.completion", "choices": []})
+
+    client = _client(handler, max_retries=3)
+    if calls_expected == 1:
+        with pytest.raises(APIStatusError):
+            client.chat.completions.create(model="m", messages=[])
+    else:
+        client.chat.completions.create(model="m", messages=[])
+    assert calls["n"] == calls_expected

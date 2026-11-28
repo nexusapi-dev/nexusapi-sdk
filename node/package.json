@@ -1,6 +1,6 @@
 {
   "name": "nexusapi-sdk",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Node.js / TypeScript SDK for NexusAPI — video, image and text models through a single API (Veo, Kling, Seedance, Nano-Banana, Claude, GPT). OpenAI-compatible /v1 with streaming. Auto-retries, auto idempotency.",
   "keywords": [
     "ai",
@@ -65,7 +65,8 @@
     "build": "rm -rf dist && tsc -p tsconfig.json && tsc -p tsconfig.cjs.json && node -e \"require('fs').writeFileSync('dist/cjs/package.json', JSON.stringify({type: 'commonjs'}) + '\\n')\"",
     "prepublishOnly": "npm run build",
     "typecheck": "tsc --noEmit",
-    "test": "npm run build && node --test tests/*.test.js tests/*.test.cjs"
+    "test": "npm run build && node --test tests/*.test.js tests/*.test.cjs",
+    "examples:check": "tsc -p tsconfig.examples.json"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

@@ -1,5 +1,5 @@
 /**
- * NexusAPI клиент и Task-объект для Node 18+.
+ * NexusAPI клиент и Task-объект для Node 20+.
  *
  * Дизайн: OpenAI/Stripe-стиль, `client.<resource>.<verb>(...)`. Без зависимостей —
  * используется встроенный fetch.
@@ -39,6 +39,7 @@ import {
 } from "./errors.js";
 import {
   backoffDelayMs,
+  clock,
   CONFLICT_WAIT_BUDGET_MS,
   DEFAULT_GENERATE_TIMEOUT_MS,
   DEFAULT_LONG_TIMEOUT_MS,
@@ -74,7 +75,7 @@ const DEFAULT_MAX_RETRIES = 2;
 export const ENV_API_KEY = "NEXUSAPI_API_KEY";
 export const ENV_BASE_URL = "NEXUSAPI_BASE_URL";
 /** Версия SDK (уходит в User-Agent). Тест сверяет её с package.json. */
-export const VERSION = "0.4.0";
+export const VERSION = "0.5.0";
 
 // ============================================================
 // Типы
@@ -432,9 +433,9 @@ export class Task {
     const timeoutMs = opts.timeoutMs ?? 600_000;
     const interval = opts.pollIntervalMs ?? 3_000;
     const { signal } = opts;
-    const deadline = Date.now() + timeoutMs;
+    const deadline = clock.now() + timeoutMs;
     while (!this.isDone) {
-      const remaining = deadline - Date.now();
+      const remaining = deadline - clock.now();
       if (remaining <= 0) {
         throw this.#attach(
           new TaskTimeoutError(
@@ -448,7 +449,7 @@ export class Task {
       try {
         await this.refresh({ signal });
       } catch (e) {
-        if (signal?.aborted || !isTransientError(e) || Date.now() >= deadline) {
+        if (signal?.aborted || !isTransientError(e) || clock.now() >= deadline) {
           if (e instanceof NexusError) this.#attach(e);
           throw e;
         }
@@ -632,7 +633,7 @@ export interface TransportOptions {
   extraHeaders?: Record<string, string>;
   /** Таймаут запроса, мс: для обычных запросов — вместе с чтением тела, для стрима — до заголовков. */
   timeoutMs?: number;
-  /** Общий лимит вызова (Date.now()-время): повторы и ожидания не выходят за него. */
+  /** Общий лимит вызова (по `clock.now()`): повторы и ожидания не выходят за него. */
   deadlineMs?: number;
   /** Повторы — только в первые N мс вызова (чат: пока сервер держит замок ключа). */
   retryWindowMs?: number;
@@ -799,13 +800,16 @@ export class NexusClient {
     // Сериализуем один раз и до цикла: ошибка в данных — не повод для повторов.
     const payload = body !== undefined ? JSON.stringify(body) : undefined;
 
-    const startedAt = Date.now();
+    const startedAt = clock.now();
     const { deadlineMs } = opts;
     const windowEnd = opts.retryWindowMs !== undefined ? startedAt + opts.retryWindowMs : undefined;
-    /** Можно ли ещё повторить через `delay` мс (окно повторов и общий лимит вызова). */
+    /**
+     * Можно ли ещё повторить через `delay` мс: сам повтор, а не только решение о нём,
+     * должен попасть в окно повторов и в общий лимит вызова.
+     */
     const allows = (delay: number): boolean => {
-      const now = Date.now();
-      if (windowEnd !== undefined && now >= windowEnd) return false;
+      const now = clock.now();
+      if (windowEnd !== undefined && now + delay >= windowEnd) return false;
       if (deadlineMs !== undefined && now + delay >= deadlineMs) return false;
       return true;
     };
@@ -823,7 +827,7 @@ export class NexusClient {
       else signal?.addEventListener("abort", onUserAbort, { once: true });
       let timedOut = false;
       const attemptTimeout =
-        deadlineMs !== undefined ? Math.max(1, Math.min(timeoutMs, deadlineMs - Date.now())) : timeoutMs;
+        deadlineMs !== undefined ? Math.max(1, Math.min(timeoutMs, deadlineMs - clock.now())) : timeoutMs;
       const timeoutHandle = setTimeout(() => {
         timedOut = true;
         controller.abort();
@@ -869,7 +873,7 @@ export class NexusClient {
       // 409 после повтора самого SDK: первый запрос с этим ключом ещё выполняется
       // на сервере. Ждём его сохранённый ответ, а не сдаёмся.
       if (resp.status === 409 && idempotencyKey && attempt > 0 && !stream) {
-        const now = Date.now();
+        const now = clock.now();
         conflictDeadline ??= now + CONFLICT_WAIT_BUDGET_MS;
         const delay = Math.min(backoffDelayMs(conflictAttempt), 5_000, conflictDeadline - now);
         if (now < conflictDeadline && allows(delay)) {

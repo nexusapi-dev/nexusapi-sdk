@@ -105,8 +105,21 @@ with client.chat.completions.create(
             print(chunk["choices"][0]["delta"].get("content") or "", end="", flush=True)
 ```
 
+Если нужен только итог — `stream.text()` (весь текст) или
+`stream.final_completion()` (обычный ответ `chat.completion` с текстом, вызовами
+инструментов и `usage`): они дочитывают стрим сами. Можно и напечатать ответ в
+цикле, и потом взять итог: уже прочитанные чанки учитываются, повторный вызов
+вернёт то же. После `close()` вернётся то, что успело прийти (`finish_reason` —
+`None`); если стрим кончился ошибкой, помощники бросят её снова.
+
+```python
+stream = client.chat.completions.create(model="gpt-6-luna", messages=[...], stream=True)
+reply = stream.final_completion()
+print(reply["choices"][0]["message"]["content"], reply.get("usage"))
+```
+
 Async: `stream = await client.chat.completions.create(..., stream=True)`, затем
-`async for chunk in stream`. Если провайдер не смог закончить ответ, сервер
+`async for chunk in stream` или `await stream.text()`. Если модель не смогла закончить ответ, сервер
 присылает ошибку внутри стрима — SDK бросает `StreamError`; обрыв соединения
 посреди стрима — `NetworkError`.
 
@@ -232,7 +245,7 @@ event = webhooks.unwrap(body, request.headers, secret=WEBHOOK_SECRET)
     можно дождаться через `client.tasks.get(err.task_id).wait()`.
   - Чат: сервер хранит только успешный ответ — после 5xx повтор вызовет
     модель снова. Поэтому 500 и 503 SDK у чата сам не повторяет, а остальные
-    повторы делает только в первые 9 минут вызова, пока сервер держит замок
+    повторы делает только в первые 14 минут вызова, пока сервер держит замок
     ключа.
   - Стрим чата повторить нельзя: сервер его не сохраняет.
   - В поддержку пишите с `request_id` — по нему находят запрос в логах.
@@ -343,6 +356,12 @@ models = client.models.list()
 for m in models:
     print(f"{m['id']}: {m['priceRub']}₽ за {m['unit']}")
 ```
+
+## Готовые скрипты
+
+Готовые скрипты — в [examples/](https://github.com/nexusapi-dev/nexusapi-sdk/tree/main/python/examples): картинка и видео, чат
+и стрим, обработка ошибок с безопасным повтором, приём вебхуков, параллельные
+запросы. Проверка против живого API — [smoke/](https://github.com/nexusapi-dev/nexusapi-sdk/tree/main/smoke).
 
 ## Документация
 

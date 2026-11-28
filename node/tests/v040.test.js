@@ -5,6 +5,7 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
+import { clock } from "../dist/internal.js";
 import {
   APIStatusError,
   APITimeoutError,
@@ -13,6 +14,7 @@ import {
   NetworkError,
   NexusClient,
   NexusError,
+  StreamError,
   ValidationError,
   WebhookVerificationError,
   unwrapWebhook,
@@ -284,4 +286,122 @@ describe("review fixes", () => {
     await client(fetchMock).v1.videos.create({ model: "m", prompt: "p", timeoutMs: 5_000 });
     assert.equal("timeoutMs" in calls[0], false);
   });
+});
+
+// ============================================================
+// 0.5.0: помощники стрима
+// ============================================================
+
+describe("stream helpers", () => {
+  const chunks = [
+    { id: "c-1", created: 1, model: "m", choices: [{ index: 0, delta: { role: "assistant", content: "При" } }] },
+    { id: "c-1", choices: [{ index: 0, delta: { content: "вет" } }] },
+    { id: "c-1", choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "get_", arguments: '{"ci' } }] } }] },
+    { id: "c-1", choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { name: "weather", arguments: 'ty": "Baku"}' } }] }, finish_reason: "tool_calls" }] },
+    { id: "c-1", choices: [], usage: { prompt_tokens: 3, completion_tokens: 5 } },
+  ];
+  const body = chunks.map((c) => `data: ${JSON.stringify(c)}\n\n`).join("") + "data: [DONE]\n\n";
+
+  it("text() and finalCompletion()", async () => {
+    const { fetchMock } = mockFetch(() => new Response(body, { status: 200 }));
+    const c = client(fetchMock);
+    assert.equal(await (await c.chat.completions.create({ model: "m", messages: [], stream: true })).text(), "Привет");
+    const reply = await (await c.chat.completions.create({ model: "m", messages: [], stream: true })).finalCompletion();
+    assert.equal(reply.object, "chat.completion");
+    assert.equal(reply.id, "c-1");
+    assert.equal(reply.choices[0].message.content, "Привет");
+    assert.deepEqual(reply.choices[0].message.tool_calls, [
+      { id: "call_1", type: "function", function: { name: "get_weather", arguments: '{"city": "Baku"}' } },
+    ]);
+    assert.equal(reply.choices[0].finish_reason, "tool_calls");
+    assert.deepEqual(reply.usage, { prompt_tokens: 3, completion_tokens: 5 });
+  });
+
+  const open = async (text) => {
+    const { fetchMock } = mockFetch(() => new Response(text, { status: 200 }));
+    return client(fetchMock).chat.completions.create({ model: "m", messages: [], stream: true });
+  };
+
+  it("helpers include chunks already read in a loop and repeat the same result", async () => {
+    const stream = await open(body);
+    for await (const chunk of stream) {
+      assert.ok(chunk);
+    }
+    const final = await stream.finalCompletion();
+    assert.equal(final.choices[0].message.content, "Привет");
+    assert.deepEqual(final.usage, { prompt_tokens: 3, completion_tokens: 5 });
+    final.choices[0].message.content = "изменено";
+    assert.equal((await stream.finalCompletion()).choices[0].message.content, "Привет");
+    assert.equal(await stream.text(), "Привет");
+  });
+
+  it("after break the connection is closed and helpers return what arrived", async () => {
+    const stream = await open(body);
+    for await (const chunk of stream) {
+      assert.ok(chunk);
+      break;
+    }
+    const final = await stream.finalCompletion();
+    assert.equal(final.choices[0].message.content, "При");
+    assert.equal(final.choices[0].finish_reason, null);
+  });
+
+  it("keeps refusal, logprobs and unknown fields; ignores __proto__", async () => {
+    const events = [
+      { id: "c-1", model: "m", service_tier: "default",
+        choices: [{ index: 0, delta: { role: "assistant", refusal: "Не " }, logprobs: { content: [{ token: "Не" }] } }] },
+      { id: "c-1", choices: [{ index: 0, delta: { refusal: "могу" }, logprobs: { content: [{ token: " могу" }] }, finish_reason: "stop" }] },
+      { id: "c-1", choices: [{ index: 1, delta: { content: "" }, finish_reason: "stop" }] },
+    ];
+    const text = events.map((e) => `data: ${JSON.stringify(e)}\n\n`).join("") +
+      'data: {"id": "c-1", "choices": [{"index": 0, "delta": {"__proto__": {"polluted": true}}}]}\n\n' +
+      "data: [DONE]\n\n";
+    const final = await (await open(text)).finalCompletion();
+    const [first, second] = final.choices;
+    assert.deepEqual(first.message, { role: "assistant", content: null, refusal: "Не могу" });
+    assert.deepEqual(first.logprobs.content.map((t) => t.token), ["Не", " могу"]);
+    assert.equal(final.service_tier, "default");
+    assert.equal(second.index, 1);
+    assert.equal(second.message.content, "");
+    assert.equal({}.polluted, undefined);
+  });
+
+  it("helpers rethrow a stream error instead of returning a partial answer", async () => {
+    const text = `data: ${JSON.stringify(chunks[0])}\n\n` + 'data: {"error": {"message": "upstream failed"}}\n\n';
+    const stream = await open(text);
+    await assert.rejects(async () => {
+      for await (const chunk of stream) assert.ok(chunk);
+    }, StreamError);
+    await assert.rejects(() => stream.finalCompletion(), StreamError);
+  });
+});
+
+describe("chat retry window", () => {
+  let realNow;
+  let t = 0;
+  beforeEach(() => {
+    realNow = clock.now;
+    t = 0;
+    clock.now = () => t;
+  });
+  afterEach(() => {
+    clock.now = realNow;
+  });
+
+  for (const [retryAfter, expectedCalls] of [["60", 1], ["0", 2]]) {
+    it(`Retry-After ${retryAfter}s at 839s → ${expectedCalls} request(s)`, async () => {
+      const { fetchMock, calls } = mockFetch((_call, n) => {
+        if (n === 1) {
+          t = 839_000;
+          return json(429, { error: { message: "busy" } }, { "Retry-After": retryAfter });
+        }
+        return json(200, { id: "c", object: "chat.completion", choices: [] });
+      });
+      const c = client(fetchMock, { maxRetries: 3 });
+      const call = c.chat.completions.create({ model: "m", messages: [] });
+      if (expectedCalls === 1) await assert.rejects(call, (e) => e instanceof APIStatusError && e.status === 429);
+      else await call;
+      assert.equal(calls.length, expectedCalls);
+    });
+  }
 });
