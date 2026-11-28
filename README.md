@@ -9,7 +9,7 @@
 
 | Язык | Пакет | Каталог | Установка |
 |---|---|---|---|
-| Python 3.10+ | [![PyPI](https://img.shields.io/pypi/v/nexusapi-sdk)](https://pypi.org/project/nexusapi-sdk/) | [`python/`](python/) | `pip install nexusapi-sdk` |
+| Python 3.10+ | [![PyPI](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fpypi.org%2Fpypi%2Fnexusapi-sdk%2Fjson&query=%24.info.version&prefix=v&label=pypi)](https://pypi.org/project/nexusapi-sdk/) | [`python/`](python/) | `pip install nexusapi-sdk` |
 | Node.js 20+ / TypeScript | [![npm](https://img.shields.io/npm/v/nexusapi-sdk)](https://www.npmjs.com/package/nexusapi-sdk) | [`node/`](node/) | `npm install nexusapi-sdk` |
 
 Оба SDK умеют:
