@@ -66,7 +66,9 @@ cd python && python -m pip install -e ".[test]" && python -m pytest
 cd node && npm ci && npm test
 ```
 
-Тесты не ходят в сеть — HTTP подменяется моками. Выпуск версий описан в
+Тесты не ходят в сеть — HTTP подменяется моками. Проверка против живого API —
+[smoke/](smoke/README.md). Примеры: [python/examples](python/examples),
+[node/examples](node/examples). Выпуск версий описан в
 [RELEASING.md](RELEASING.md), уязвимости — [SECURITY.md](SECURITY.md).
 
 ## Поддерживаемые версии

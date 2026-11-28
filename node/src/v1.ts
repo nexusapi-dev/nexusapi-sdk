@@ -8,6 +8,7 @@ import { NexusError, TaskFailedError, TaskTimeoutError } from "./errors.js";
 import {
   CHAT_RETRY_STATUSES,
   CHAT_RETRY_WINDOW_MS,
+  clock,
   compact,
   deadlineFrom,
   getHeader,
@@ -347,13 +348,13 @@ export class V1Videos {
     const interval = opts.pollIntervalMs ?? 3_000;
     const { signal } = opts;
     const id = videoId(video);
-    const deadline = Date.now() + timeoutMs;
+    const deadline = clock.now() + timeoutMs;
     let current: Partial<VideoObject> = { id };
     while (true) {
       try {
         current = await this.retrieve(id, { signal });
       } catch (e) {
-        if (signal?.aborted || !isTransientError(e) || Date.now() >= deadline) {
+        if (signal?.aborted || !isTransientError(e) || clock.now() >= deadline) {
           if (e instanceof NexusError) e.taskId = id;
           throw e;
         }
@@ -370,7 +371,7 @@ export class V1Videos {
         throw err;
       }
       if (current.status === "completed") return current as VideoObject;
-      const remaining = deadline - Date.now();
+      const remaining = deadline - clock.now();
       if (remaining <= 0) {
         const err = new TaskTimeoutError(
           `Video ${id} did not complete within ${timeoutMs}ms (last status: ${current.status}); ` +

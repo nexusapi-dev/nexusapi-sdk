@@ -17,8 +17,14 @@ export function requestTransport(options: RequestOptions): TransportOptions {
   };
 }
 
+/**
+ * @internal Монотонные часы для дедлайнов и окна повторов: перевод системного
+ * времени их не сдвигает. Объект, а не функция, — чтобы тесты могли подменить.
+ */
+export const clock = { now: (): number => performance.now() };
+
 export function deadlineFrom(timeoutMs: number | undefined): number | undefined {
-  return timeoutMs === undefined ? undefined : Date.now() + timeoutMs;
+  return timeoutMs === undefined ? undefined : clock.now() + timeoutMs;
 }
 
 /** Ставит заголовок без учёта регистра: `authorization` и `Authorization` — один заголовок. */
@@ -70,10 +76,10 @@ export const CHAT_RETRY_STATUSES: ReadonlySet<number> = new Set([429, 502, 504])
 // по таймауту): ответ не сохраняется, и повтор снова платно отправил бы запрос
 // поставщику. Поэтому 503 у чата не повторяем.
 
-// Замок Idempotency-Key на сервере живёт 600 с: после этого повтор чата мог бы
+// Замок Idempotency-Key на сервере живёт 900 с: после этого повтор чата мог бы
 // запустить модель второй раз, пока первый запрос ещё идёт. Повторы и ожидание
-// 409 для чата — только в первые 540 с вызова.
-export const CHAT_RETRY_WINDOW_MS = 540_000;
+// 409 для чата — только в первые 840 с вызова (с запасом до конца замка).
+export const CHAT_RETRY_WINDOW_MS = 840_000;
 
 // У /v1/images 500 означает, что задача завершилась ошибкой: повтор с тем же
 // ключом вернёт ту же упавшую задачу. Остальные 5xx повторяем.

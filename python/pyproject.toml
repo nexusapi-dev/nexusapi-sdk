@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nexusapi-sdk"
-version = "0.4.0"
+version = "0.5.0"
 description = "Python SDK для NexusAPI — видео, изображения и текстовые модели через единый API (Veo, Kling, Seedance, Nano-Banana, Claude, GPT). OpenAI-совместимый /v1 со стримингом, sync + async, auto-retries, auto idempotency."
 readme = "README.md"
 requires-python = ">=3.10"

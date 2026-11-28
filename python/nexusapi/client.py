@@ -62,7 +62,9 @@ import warnings
 from dataclasses import dataclass, field
 from typing import (
     Any,
+    AsyncGenerator,
     AsyncIterator,
+    Generator,
     Iterator,
     Literal,
     Mapping,
@@ -138,10 +140,10 @@ _CHAT_RETRY_STATUSES = frozenset({429, 502, 504})
 # по таймауту): ответ не сохраняется, и повтор снова платно отправил бы запрос
 # поставщику. Поэтому 503 у чата не повторяем.
 #
-# Замок Idempotency-Key на сервере живёт 600 с: после этого повтор чата мог бы
+# Замок Idempotency-Key на сервере живёт 900 с: после этого повтор чата мог бы
 # запустить модель второй раз, пока первый запрос ещё идёт. Повторы и ожидание
-# 409 для чата — только в первые 540 с вызова.
-_CHAT_RETRY_WINDOW = 540.0
+# 409 для чата — только в первые 840 с вызова (с запасом до конца замка).
+_CHAT_RETRY_WINDOW = 840.0
 
 # У /v1/images 500 означает, что задача завершилась ошибкой: повтор с тем же
 # ключом вернёт ту же упавшую задачу. Остальные 5xx повторяем.
@@ -303,8 +305,10 @@ class _RetryBudget:
         self.conflict_deadline: Optional[float] = None
 
     def allows(self, delay: float) -> bool:
+        """Повтор уйдёт через `delay` секунд: и он, а не только решение о нём,
+        должен попасть в окно повторов и в общий дедлайн."""
         now = time.monotonic()
-        if self.window_end is not None and now >= self.window_end:
+        if self.window_end is not None and now + delay >= self.window_end:
             return False
         if self.deadline is not None and now + delay >= self.deadline:
             return False
@@ -441,6 +445,107 @@ def _decode_stream_event(payload: str) -> Any:
     return event
 
 
+_UNSET = object()
+
+
+def _choice_index(value: Any) -> int:
+    return value if type(value) is int and value >= 0 else 0
+
+
+def _merge_fragment(target: dict[str, Any], fragment: Mapping[str, Any]) -> None:
+    """Склеивает дельту так же, как сервер: строки дописываются (кроме `role`,
+    `id`, `type` — они заменяются), словари сливаются, списки дополняются,
+    остальное заменяется. `None` не затирает уже пришедшее значение."""
+    for key, value in fragment.items():
+        if value is None:
+            target.setdefault(key, None)
+            continue
+        old = target.get(key)
+        if isinstance(value, str):
+            if key in ("role", "id", "type"):
+                target[key] = value
+            else:
+                target[key] = (old if isinstance(old, str) else "") + value
+        elif isinstance(value, Mapping):
+            if not isinstance(old, dict):
+                old = target[key] = {}
+            _merge_fragment(old, value)
+        elif isinstance(value, list):
+            if not isinstance(old, list):
+                old = target[key] = []
+            old.extend(copy.deepcopy(value))
+        else:
+            target[key] = copy.deepcopy(value)
+
+
+class _ChunkAccumulator:
+    """Собирает чанки `chat.completion.chunk` в один ответ `chat.completion` по
+    тем же правилам, что и сервер для обычного ответа: текст, reasoning,
+    refusal, logprobs и вызовы инструментов (их куски склеиваются по `index`),
+    finish_reason и usage. Неизвестные поля не теряются."""
+
+    def __init__(self) -> None:
+        self.result: dict[str, Any] = {"object": "chat.completion"}
+        self.choices: dict[int, dict[str, Any]] = {}
+        self.tools: dict[int, dict[int, dict[str, Any]]] = {}
+
+    def add(self, chunk: Any) -> None:
+        if not isinstance(chunk, Mapping):
+            return
+        for key, value in chunk.items():
+            if key not in ("object", "choices", "usage"):
+                self.result[key] = copy.deepcopy(value)
+        if chunk.get("usage") is not None:
+            self.result["usage"] = copy.deepcopy(chunk["usage"])
+        for choice in chunk.get("choices") or []:
+            if not isinstance(choice, Mapping):
+                continue
+            index = _choice_index(choice.get("index"))
+            target = self.choices.setdefault(index, {
+                "index": index, "message": {"role": "assistant", "content": None}, "finish_reason": None,
+            })
+            raw_delta = choice.get("delta")
+            delta = dict(raw_delta) if isinstance(raw_delta, Mapping) else {}
+            fragments = delta.pop("tool_calls", None)
+            _merge_fragment(target["message"], delta)
+            if isinstance(fragments, list):
+                tools = self.tools.setdefault(index, {})
+                for tool in fragments:
+                    if isinstance(tool, Mapping):
+                        slot = tools.setdefault(_choice_index(tool.get("index")), {})
+                        _merge_fragment(slot, {k: v for k, v in tool.items() if k != "index"})
+            if choice.get("finish_reason") is not None:
+                target["finish_reason"] = choice["finish_reason"]
+            logprobs = choice.get("logprobs", _UNSET)
+            if isinstance(logprobs, Mapping):
+                if not isinstance(target.get("logprobs"), dict):
+                    target["logprobs"] = {}
+                _merge_fragment(target["logprobs"], logprobs)
+            elif logprobs is not _UNSET:
+                target.setdefault("logprobs", None)
+            for key, value in choice.items():
+                if key not in ("index", "delta", "finish_reason", "logprobs"):
+                    target[key] = copy.deepcopy(value)
+
+    def text(self) -> str:
+        choice = self.choices.get(0)
+        content = choice["message"].get("content") if choice else None
+        return content if isinstance(content, str) else ""
+
+    def completion(self) -> ChatCompletion:
+        result = copy.deepcopy(self.result)
+        choices: list[dict[str, Any]] = []
+        for index in sorted(self.choices):
+            choice = copy.deepcopy(self.choices[index])
+            if index in self.tools:
+                choice["message"]["tool_calls"] = [
+                    copy.deepcopy(tool) for _, tool in sorted(self.tools[index].items())
+                ]
+            choices.append(choice)
+        result["choices"] = choices
+        return cast(ChatCompletion, result)
+
+
 class Stream:
     """SSE-стрим `chat.completion.chunk`. Итерируется по dict-чанкам.
 
@@ -452,13 +557,19 @@ class Stream:
     Соединение закрывается, когда стрим дочитан, при выходе из `with` или
     при `close()`. Обрыв посреди стрима — NetworkError (без повтора);
     ошибка, присланная сервером внутри стрима, — StreamError.
+
+    `text()` и `final_completion()` учитывают и чанки, уже прочитанные в
+    цикле, и дочитывают остаток; повторный вызов вернёт тот же результат.
+    После `close()` они вернут то, что успело прийти (`finish_reason` — None).
     """
 
     def __init__(self, response: httpx.Response):
         self.response = response
+        self._accumulator = _ChunkAccumulator()
+        self._error: Optional[Exception] = None
         self._iterator = self._iter_events()
 
-    def _iter_events(self) -> Iterator[ChatCompletionChunk]:
+    def _iter_events(self) -> Generator[ChatCompletionChunk, None, None]:
         decoder = _SSEDecoder()
         try:
             try:
@@ -467,15 +578,20 @@ class Stream:
                         event = _decode_stream_event(payload)
                         if event is _STREAM_DONE:
                             return
+                        self._accumulator.add(event)
                         yield event
                 for payload in decoder.flush():
                     event = _decode_stream_event(payload)
                     if event is _STREAM_DONE:
                         return
+                    self._accumulator.add(event)
                     yield event
             except httpx.TransportError as e:
                 cls = errors.APITimeoutError if isinstance(e, httpx.TimeoutException) else errors.NetworkError
                 raise cls(f"Stream interrupted: {e}") from e
+        except Exception as e:
+            self._error = e
+            raise
         finally:
             self.response.close()
 
@@ -485,7 +601,27 @@ class Stream:
     def __next__(self) -> ChatCompletionChunk:
         return next(self._iterator)
 
+    def _drain(self) -> _ChunkAccumulator:
+        for _ in self._iterator:
+            pass
+        if self._error is not None:
+            raise self._error
+        return self._accumulator
+
+    def text(self) -> str:
+        """Дочитывает стрим и возвращает весь текст ответа (первый вариант)."""
+        return self._drain().text()
+
+    def final_completion(self) -> ChatCompletion:
+        """Дочитывает стрим и собирает обычный ответ `chat.completion`: текст,
+        вызовы инструментов, finish_reason и usage (если сервер его прислал)."""
+        return self._drain().completion()
+
     def close(self) -> None:
+        try:
+            self._iterator.close()
+        except ValueError:  # генератор сейчас выполняется в другом потоке
+            pass
         self.response.close()
 
     def __enter__(self) -> "Stream":
@@ -496,13 +632,16 @@ class Stream:
 
 
 class AsyncStream:
-    """Async-вариант Stream: `async for chunk in stream`."""
+    """Async-вариант Stream: `async for chunk in stream`; помощники `text()` и
+    `final_completion()` работают так же, как у Stream."""
 
     def __init__(self, response: httpx.Response):
         self.response = response
+        self._accumulator = _ChunkAccumulator()
+        self._error: Optional[Exception] = None
         self._iterator = self._iter_events()
 
-    async def _iter_events(self) -> AsyncIterator[ChatCompletionChunk]:
+    async def _iter_events(self) -> AsyncGenerator[ChatCompletionChunk, None]:
         decoder = _SSEDecoder()
         try:
             try:
@@ -511,15 +650,20 @@ class AsyncStream:
                         event = _decode_stream_event(payload)
                         if event is _STREAM_DONE:
                             return
+                        self._accumulator.add(event)
                         yield event
                 for payload in decoder.flush():
                     event = _decode_stream_event(payload)
                     if event is _STREAM_DONE:
                         return
+                    self._accumulator.add(event)
                     yield event
             except httpx.TransportError as e:
                 cls = errors.APITimeoutError if isinstance(e, httpx.TimeoutException) else errors.NetworkError
                 raise cls(f"Stream interrupted: {e}") from e
+        except Exception as e:
+            self._error = e
+            raise
         finally:
             await self.response.aclose()
 
@@ -529,7 +673,26 @@ class AsyncStream:
     async def __anext__(self) -> ChatCompletionChunk:
         return await self._iterator.__anext__()
 
+    async def _drain(self) -> _ChunkAccumulator:
+        async for _ in self._iterator:
+            pass
+        if self._error is not None:
+            raise self._error
+        return self._accumulator
+
+    async def text(self) -> str:
+        """Дочитывает стрим и возвращает весь текст ответа (первый вариант)."""
+        return (await self._drain()).text()
+
+    async def final_completion(self) -> ChatCompletion:
+        """Дочитывает стрим и собирает обычный ответ `chat.completion`."""
+        return (await self._drain()).completion()
+
     async def close(self) -> None:
+        try:
+            await self._iterator.aclose()
+        except RuntimeError:  # генератор сейчас выполняется в другой задаче
+            pass
         await self.response.aclose()
 
     async def __aenter__(self) -> "AsyncStream":

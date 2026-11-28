@@ -1,0 +1,11 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": ".",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "paths": { "nexusapi-sdk": ["./src/index.ts"] }
+  },
+  "include": ["examples/**/*.ts", "src/**/*.ts"]
+}
